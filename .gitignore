@@ -1,0 +1,12 @@
+.env
+*.log
+node_modules/
+.omx/
+.claude/
+*.bak
+*.backup*
+*.pre-summary
+pre_fix_solar_lead_gen_backup.tsv
+jennifer-proxy-*.log
+proxy.log
+.DS_Store
