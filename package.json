@@ -2,7 +2,6 @@
   "name": "jennifer-proxy",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
   "description": "Render runtime for Jennifer proxy",
   "dependencies": {}
 }
