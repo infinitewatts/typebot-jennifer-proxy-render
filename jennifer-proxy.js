@@ -186,7 +186,7 @@ function getDiscoveryQuestion(intent, messages) {
     return "what got you looking into that equipment specifically?";
   }
   if (intent === INTENTS.BATTERY) return "what happened that made you start looking at batteries?";
-  if (intent === INTENTS.QUOTE_SHOPPER) return "what made you unsure about that quote?";
+  if (intent === INTENTS.QUOTE_SHOPPER) return "what part of the quote made you want a second opinion?";
   if (intent === INTENTS.SKEPTIC) return "what would make solar feel like a bad deal to you?";
   if (intent === INTENTS.COMMERCIAL) return "what are you hoping solar would change for the business?";
   if (intent === INTENTS.NEW_BUILD) return "what made you want solar planned into the build from the start?";
@@ -840,6 +840,7 @@ function postProcess(text, stage, session) {
   result = result
     .replace(/[^.!?]*\b\d+\s*[- ]?panel system\b[^.!?]*[.!?]?/gi, "")
     .replace(/[^.!?]*\b(?:offset percentage|100%\s*offset|blended rate)\b[^.!?]*[.!?]?/gi, "")
+    .replace(/[^.!?]*\bwe(?:'|’)?ve yet to see\b[^.!?]*[.!?]?/gi, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 
@@ -859,7 +860,7 @@ function postProcess(text, stage, session) {
   if (
     stage === STAGES.DISCOVER &&
     vagueCount < 2 &&
-    /(?:bill|backup|comparing options|compare options|lower the bill|cover outages|trying to lower|looking at backup|mostly the bill)/i.test(result) &&
+    /(?:bill|backup|comparing options|compare options|lower the bill|cover outages|trying to lower|looking at backup|mostly the bill|either the bill|bill or backup)/i.test(result) &&
     /\?/.test(result) &&
     [INTENTS.EQUIPMENT, INTENTS.BATTERY, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL, INTENTS.CURIOUS].includes(intent)
   ) {
@@ -877,9 +878,38 @@ function postProcess(text, stage, session) {
     stage === STAGES.DISCOVER &&
     !hasReason &&
     /(?:OGE|OG&E|PSO|electric company|utility)/i.test(allUserText) &&
-    /\b(?:bill|backup|comparing|lower|outages)\b/i.test(result)
+    /\b(?:bill|backup|comparing|lower|outages|own your home|name|call|homeowner|electric bill)\b/i.test(result)
   ) {
     result = "got it. what made you start checking into solar?";
+  }
+
+  const discoveryQuestion = getDiscoveryQuestion(intent, messages);
+  const escapedDiscovery = discoveryQuestion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const discoveryMatches = result.match(new RegExp(escapedDiscovery, "gi")) || [];
+  if (discoveryMatches.length > 1) {
+    result = result.replace(new RegExp("\\s*" + escapedDiscovery, "i"), "");
+  }
+
+  if (
+    stage === STAGES.DISCOVER &&
+    hasReason &&
+    result.toLowerCase().includes(discoveryQuestion.toLowerCase())
+  ) {
+    if (intent === INTENTS.BATTERY) {
+      result = "that makes sense. how long were you without power the worst time?";
+    } else if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(allUserText)) {
+      result = "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?";
+    } else if (intent === INTENTS.QUOTE_SHOPPER) {
+      result = "that helps. what part of the quote felt hardest to trust?";
+    }
+  }
+
+  if (
+    stage === STAGES.DISCOVER &&
+    /\bhail\b/i.test(allUserText) &&
+    /\b(?:what'?s your name|have Eric call|call you|call him|reach out)\b/i.test(result)
+  ) {
+    result = "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?";
   }
 
   // CONFIRM stage: no questions allowed
@@ -1163,7 +1193,7 @@ function extractContext(messages) {
     motivations.push("referral");
   if (motivations.length > 0) context.motivation = motivations.join(", ");
 
-  if (/\b(commercial|business|warehouse|office|shop|facility|church|company)\b/i.test(allUserText)) {
+  if (/\b(commercial|business|warehouse|office|shop|facility|church|my company|our company)\b/i.test(allUserText)) {
     context.propertyType = "commercial";
   } else if (/\b(house|home|residential|roof)\b/i.test(allUserText)) {
     context.propertyType = "residential";
