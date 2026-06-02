@@ -25,6 +25,10 @@ const CHAT_HISTORY_FILE = path.resolve(
   process.env.JENNIFER_CHAT_HISTORY_FILE ||
     path.join(__dirname, "chat-history.jsonl")
 );
+const CHAT_LEADS_FILE = path.resolve(
+  process.env.JENNIFER_CHAT_LEADS_FILE ||
+    path.join(__dirname, "chat-leads.jsonl")
+);
 const CHAT_HISTORY_MAX_MESSAGES = Math.max(
   1,
   parseInt((process.env.JENNIFER_CHAT_HISTORY_MAX_MESSAGES || "500").trim(), 10) || 500
@@ -60,6 +64,7 @@ const systemPrompt = fs.readFileSync(systemPromptPath, "utf8");
 
 const sessions = new Map();
 const historyBySession = new Map();
+const leadsBySession = new Map();
 
 // --- Stage definitions (forward-only) ---
 
@@ -151,6 +156,26 @@ function loadHistoryFromDisk() {
   }
 }
 
+function loadLeadsFromDisk() {
+  try {
+    if (!fs.existsSync(CHAT_LEADS_FILE)) return;
+    const raw = fs.readFileSync(CHAT_LEADS_FILE, "utf8");
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim());
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (!parsed || typeof parsed.sessionId !== "string") continue;
+        leadsBySession.set(parsed.sessionId, parsed);
+      } catch (err) {
+        console.error("Skipping invalid lead line:", err.message);
+      }
+    }
+    console.log("Loaded chat leads:", leadsBySession.size);
+  } catch (err) {
+    console.error("Failed to load chat leads:", err.message);
+  }
+}
+
 function hasHistoryRecord(sessionId, role, content, at) {
   const messages = historyBySession.get(sessionId) || [];
   return messages.some(
@@ -208,6 +233,28 @@ function importHistoryRecords(records) {
   }
 
   return { imported, skipped, sessions: historyBySession.size };
+}
+
+function storeLeadRecord(lead) {
+  if (!lead || !lead.sessionId) return false;
+  if (leadsBySession.has(lead.sessionId)) return false;
+
+  leadsBySession.set(lead.sessionId, lead);
+  const record = JSON.stringify(lead) + "\n";
+  fs.appendFile(CHAT_LEADS_FILE, record, (err) => {
+    if (err) {
+      console.error("Lead write error:", err.message);
+    }
+  });
+  return true;
+}
+
+function getLeadsPayload() {
+  return Array.from(leadsBySession.values()).sort((a, b) => {
+    const aTime = new Date(a.createdAt || 0).getTime();
+    const bTime = new Date(b.createdAt || 0).getTime();
+    return bTime - aTime;
+  });
 }
 
 function getStoredSessionMessages(sessionId) {
@@ -1061,6 +1108,10 @@ function summarizeConversation(messages, callback) {
 
 function checkAndSendLead(session, sessionId) {
   if (session.leadSent) return;
+  if (leadsBySession.has(sessionId)) {
+    session.leadSent = true;
+    return;
+  }
   if (!session.leadData.name || !session.leadData.phone || !session.leadData.time) return;
 
   const context = extractContext(session.messages);
@@ -1069,22 +1120,21 @@ function checkAndSendLead(session, sessionId) {
   const leadPhone = formatLeadPhone(session.leadData.phone);
   const leadName = session.leadData.name;
 
+  const leadRecord = {
+    sessionId,
+    name: leadName,
+    phone: leadPhone,
+    time: session.leadData.time,
+    utility: context.utility || null,
+    bill: context.bill || null,
+    motivation: context.motivation || null,
+    createdAt: new Date().toISOString(),
+    source: "jennifer-chat",
+  };
+  storeLeadRecord(leadRecord);
+
   console.log("=== LEAD CAPTURED ===");
-  console.log(
-    JSON.stringify(
-      {
-        name: leadName,
-        phone: leadPhone,
-        time: session.leadData.time,
-        utility: context.utility,
-        bill: context.bill,
-        motivation: context.motivation,
-        timestamp: new Date().toISOString(),
-      },
-      null,
-      2
-    )
-  );
+  console.log(JSON.stringify(leadRecord, null, 2));
   console.log("=====================");
 
   // Build details + summary for Eric — send immediately so he's ready
@@ -1191,6 +1241,13 @@ const server = http.createServer((req, res) => {
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ sessions: sessionsSummary }));
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/leads") {
+    if (!isHistoryAuthorized(requestUrl.searchParams, res)) return;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ leads: getLeadsPayload(), count: leadsBySession.size }));
     return;
   }
 
@@ -1402,6 +1459,7 @@ const server = http.createServer((req, res) => {
 });
 
 loadHistoryFromDisk();
+loadLeadsFromDisk();
 
 server.listen(PORT, () => {
   console.log("Solar chat proxy listening on port " + PORT);
