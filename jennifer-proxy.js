@@ -176,6 +176,254 @@ function getHistoryPayload(sessionId) {
   return getStoredSessionMessages(sessionId);
 }
 
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderHistoryUi(token) {
+  const tokenQuery = token ? "?token=" + encodeURIComponent(token) : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jennifer Chat History</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f4ef;
+      --panel: #ffffff;
+      --ink: #1d2423;
+      --muted: #66736f;
+      --line: #d9ded9;
+      --accent: #176b5d;
+      --accent-soft: #dcebe6;
+      --user: #eaf3ef;
+      --assistant: #f7f0df;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, var(--bg) 0%, #ebe8dd 100%);
+      color: var(--ink);
+    }
+    header {
+      padding: 22px 24px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.76);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      backdrop-filter: blur(12px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 720;
+    }
+    .meta {
+      color: var(--muted);
+      margin-top: 5px;
+      font-size: 13px;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+      min-height: calc(100vh - 74px);
+    }
+    aside {
+      border-right: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.58);
+      overflow: auto;
+      max-height: calc(100vh - 74px);
+    }
+    .session {
+      width: 100%;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: transparent;
+      color: inherit;
+      padding: 14px 16px;
+      text-align: left;
+      cursor: pointer;
+      display: block;
+    }
+    .session:hover,
+    .session.active { background: var(--accent-soft); }
+    .sid {
+      font-size: 13px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .last {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .count {
+      margin-top: 6px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    section {
+      padding: 24px;
+      overflow: auto;
+      max-height: calc(100vh - 74px);
+    }
+    .empty,
+    .error {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 18px;
+      border-radius: 8px;
+      color: var(--muted);
+    }
+    .error { color: #8f2d21; }
+    .message {
+      max-width: 780px;
+      margin: 0 0 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+    .message.user { background: var(--user); }
+    .message.assistant { background: var(--assistant); }
+    .role {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .lead {
+      max-width: 780px;
+      margin-bottom: 18px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.7);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 760px) {
+      main { grid-template-columns: 1fr; }
+      aside {
+        max-height: 260px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      section { max-height: none; padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Jennifer Chat History</h1>
+    <div class="meta" id="status">Loading sessions...</div>
+  </header>
+  <main>
+    <aside id="sessions"></aside>
+    <section id="detail"><div class="empty">Select a chat to view the conversation.</div></section>
+  </main>
+  <script>
+    const tokenQuery = ${JSON.stringify(tokenQuery)};
+    const sessionsEl = document.getElementById("sessions");
+    const detailEl = document.getElementById("detail");
+    const statusEl = document.getElementById("status");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    async function loadJson(url) {
+      const response = await fetch(url);
+      const text = await response.text();
+      if (!response.ok) throw new Error(text || response.statusText);
+      return text ? JSON.parse(text) : {};
+    }
+
+    async function loadSessions() {
+      try {
+        const data = await loadJson("/history" + tokenQuery);
+        const sessions = data.sessions || [];
+        statusEl.textContent = sessions.length + " session" + (sessions.length === 1 ? "" : "s");
+        if (!sessions.length) {
+          sessionsEl.innerHTML = '<div class="empty">No chat history has been recorded yet.</div>';
+          return;
+        }
+        sessionsEl.innerHTML = sessions.map((session, index) => {
+          const last = session.lastMessage || {};
+          return '<button class="session' + (index === 0 ? ' active' : '') + '" data-session-id="' + escapeHtml(session.sessionId) + '">' +
+            '<div class="sid">' + escapeHtml(session.sessionId) + '</div>' +
+            '<div class="last">' + escapeHtml(last.content || "") + '</div>' +
+            '<div class="count">' + escapeHtml(session.count) + ' messages</div>' +
+          '</button>';
+        }).join("");
+        sessionsEl.querySelectorAll(".session").forEach((button) => {
+          button.addEventListener("click", () => {
+            sessionsEl.querySelectorAll(".session").forEach((el) => el.classList.remove("active"));
+            button.classList.add("active");
+            loadSession(button.dataset.sessionId);
+          });
+        });
+        loadSession(sessions[0].sessionId);
+      } catch (err) {
+        statusEl.textContent = "Unable to load history";
+        detailEl.innerHTML = '<div class="error">' + escapeHtml(err.message) + '</div>';
+      }
+    }
+
+    async function loadSession(sessionId) {
+      detailEl.innerHTML = '<div class="empty">Loading chat...</div>';
+      try {
+        const separator = tokenQuery ? "&" : "?";
+        const data = await loadJson("/history" + tokenQuery + separator + "sessionId=" + encodeURIComponent(sessionId));
+        const lead = data.leadData || {};
+        const leadHtml = '<div class="lead">' +
+          '<strong>' + escapeHtml(data.sessionId) + '</strong><br>' +
+          'Name: ' + escapeHtml(lead.name || "unknown") + ' | Phone: ' + escapeHtml(lead.phone || "unknown") +
+          ' | Utility: ' + escapeHtml(lead.utility || "unknown") + ' | Bill: ' + escapeHtml(lead.bill || "unknown") +
+        '</div>';
+        const messagesHtml = (data.messages || []).map((message) =>
+          '<div class="message ' + escapeHtml(message.role) + '">' +
+            '<span class="role">' + escapeHtml(message.role) + '</span>' +
+            escapeHtml(message.content) +
+          '</div>'
+        ).join("");
+        detailEl.innerHTML = leadHtml + (messagesHtml || '<div class="empty">This session has no messages.</div>');
+      } catch (err) {
+        detailEl.innerHTML = '<div class="error">' + escapeHtml(err.message) + '</div>';
+      }
+    }
+
+    loadSessions();
+  </script>
+</body>
+</html>`;
+}
+
 function getStage(session) {
   const context = extractContext(session.messages);
   const name = extractName(session.messages);
@@ -844,6 +1092,16 @@ const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  if (
+    req.method === "GET" &&
+    (pathname === "/history-ui" || /^\/typebots\/[^/]+\/results$/.test(pathname))
+  ) {
+    if (!isHistoryAuthorized(requestUrl.searchParams, res)) return;
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderHistoryUi(requestUrl.searchParams.get("token") || ""));
     return;
   }
 
