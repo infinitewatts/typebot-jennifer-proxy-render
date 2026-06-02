@@ -137,11 +137,11 @@ function detectIntent(messages) {
   if (!userText.trim()) return INTENTS.CURIOUS;
   if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|real person)\b/i.test(userText)) return INTENTS.DIRECT_CALL;
   if (/\b(quote|quoted|quotes|bid|bids|proposal|proposals|another company|other companies|shopping around)\b/i.test(userText)) return INTENTS.QUOTE_SHOPPER;
+  if (/\b(battery|batteries|backup|outage|outages|grid goes down|off.?grid|storm|ice storm|power went out|generator)\b/i.test(userText)) return INTENTS.BATTERY;
   if (/\b(enphase|microinverter|micro.?inverter|inverter|panel|panels|tesla|powerwall|franklin|eg4|ironridge|gaf|battery brand|equipment|warranty|hail)\b/i.test(userText)) return INTENTS.EQUIPMENT;
   if (/\b(commercial|business|warehouse|office|shop|facility|church|farm|company)\b/i.test(userText)) return INTENTS.COMMERCIAL;
   if (/\b(new build|new construction|building a|building my|builder|new house|custom home)\b/i.test(userText)) return INTENTS.NEW_BUILD;
   if (/\b(rent|renter|landlord|apartment|lease)\b/i.test(userText)) return INTENTS.RENTER;
-  if (/\b(battery|backup|outage|outages|grid goes down|off.?grid|storm|ice storm|power went out|generator)\b/i.test(userText)) return INTENTS.BATTERY;
   if (/\b(scam|rip.?off|waste of money|does it actually save|catch|too good to be true)\b/i.test(userText)) return INTENTS.SKEPTIC;
   if (/\b(cost|price|pricing|how much|expensive|afford|payment|finance|financing)\b/i.test(userText)) return INTENTS.PRICE;
   if (/\b(high bill|bill|bills|paying|electric.*killing|rate|rates|OGE|OG&E|PSO)\b/i.test(userText)) return INTENTS.HIGH_BILL;
@@ -169,6 +169,8 @@ function extractReasonRaw(messages) {
     if (/^(?:OGE|OG&E|PSO|co-?op)$/i.test(text)) continue;
     if (/^\$?\d{2,4}(?:\s*(?:a month|monthly|\/mo|per month))?$/i.test(text)) continue;
     if (/^(?:morning|mornings|afternoon|afternoons|evening|evenings|anytime|after lunch)$/i.test(text)) continue;
+    if (/^(?:do you|do y'all|do you all|can i|how much|what does|is solar|are panels|does solar)\b/i.test(text)) continue;
+    if (/^(?:house|home|warehouse|business)\s+(?:in|near)\b/i.test(text)) continue;
     return text.slice(0, 300);
   }
   return null;
@@ -790,6 +792,7 @@ function postProcess(text, stage, session) {
   const intent = detectIntent(messages);
   const vagueCount = countVagueUserMessages(messages);
   const hasReason = Boolean(extractReasonRaw(messages));
+  const allUserText = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
 
   // Repeat guard: if this response is too similar to the last one, force a redirect
   if (session && session.messages.length >= 2) {
@@ -817,8 +820,8 @@ function postProcess(text, stage, session) {
 
   // Do not reintroduce Jennifer after the widget greeting.
   result = result
-    .replace(/\bhey there,\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
-    .replace(/\bhello,\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+    .replace(/^\s*(?:hi|hey|hello)(?: there)?,?\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+    .replace(/\bi['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
     .trim();
 
   // Strip address/zip asks from any stage
@@ -833,14 +836,22 @@ function postProcess(text, stage, session) {
   // Strip technical jargon
   result = result.replace(/\bkwh\b/gi, "power").replace(/\bkilowatt.hours?\b/gi, "power");
 
-  // Prevent unsupported hail/stat claims from sounding like verified company history.
-  if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(messages.map((m) => m.content).join("\n"))) {
+  // Prevent unsupported technical, sizing, offset, and hail/stat claims from sounding verified.
+  result = result
+    .replace(/[^.!?]*\b\d+\s*[- ]?panel system\b[^.!?]*[.!?]?/gi, "")
+    .replace(/[^.!?]*\b(?:offset percentage|100%\s*offset|blended rate)\b[^.!?]*[.!?]?/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (/\bhail\b/i.test(allUserText)) {
     result = result
       .replace(/[^.!?]*\b\d+(?:\.\d+)?\s*(?:\"|inches?|mph|systems?|years?)\b[^.!?]*[.!?]?/gi, "")
       .replace(/\s{2,}/g, " ")
       .trim();
     if (!result || !/\?/.test(result)) {
-      result = "hail is a fair concern in Oklahoma. what got you looking at solar even with that worry?";
+      result = hasReason
+        ? "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?"
+        : "hail is a fair concern in Oklahoma. what got you looking at solar even with that worry?";
     }
   }
 
@@ -852,7 +863,11 @@ function postProcess(text, stage, session) {
     /\?/.test(result) &&
     [INTENTS.EQUIPMENT, INTENTS.BATTERY, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL, INTENTS.CURIOUS].includes(intent)
   ) {
-    const answerPart = result.split("?")[0].replace(/[^.!]*\b(?:are you|is it|which one|what's mostly)[^.!]*$/i, "").trim();
+    const answerPart = result
+      .split(/[?!]/)[0]
+      .replace(/[^.!]*\b(?:are you|is it|which one|what's mostly|what are you|more about|which one's|how'd|what'd)[^.!]*$/i, "")
+      .replace(/[^.!]*\b(?:bill|backup|outages|comparing options|lower the bill|cover outages)\b[^.!]*$/i, "")
+      .trim();
     const question = getDiscoveryQuestion(intent, messages);
     result = (answerPart ? answerPart.replace(/[.?!]*$/, ".") + " " : "") + question;
   }
@@ -861,7 +876,7 @@ function postProcess(text, stage, session) {
   if (
     stage === STAGES.DISCOVER &&
     !hasReason &&
-    /(?:OGE|OG&E|PSO|electric company|utility)/i.test(messages.filter((m) => m.role === "user").map((m) => m.content).join("\n")) &&
+    /(?:OGE|OG&E|PSO|electric company|utility)/i.test(allUserText) &&
     /\b(?:bill|backup|comparing|lower|outages)\b/i.test(result)
   ) {
     result = "got it. what made you start checking into solar?";
