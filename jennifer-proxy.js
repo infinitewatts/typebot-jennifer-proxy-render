@@ -847,13 +847,20 @@ function extractName(messages) {
 
 function extractTime(messages) {
   for (let i = 1; i < messages.length; i++) {
-    const prev = messages[i - 1];
     const curr = messages[i];
-    if (
-      prev.role === "assistant" &&
-      curr.role === "user" &&
-      /morning|afternoon|evening|what time|time.*good|catch you/i.test(prev.content)
-    ) {
+    if (curr.role !== "user") continue;
+
+    const recentAssistantAsk = messages
+      .slice(Math.max(0, i - 4), i)
+      .some(
+        (msg) =>
+          msg.role === "assistant" &&
+          /morning|afternoon|evening|what time|time.*good|catch you|works better|usually better/i.test(
+            msg.content
+          )
+      );
+
+    if (recentAssistantAsk) {
       const text = curr.content.trim().toLowerCase();
       if (/\d{3}[\s.\-]\d{3,4}/.test(text)) continue; // looks like a phone number, skip
       if (/morning/i.test(text)) return "mornings";
