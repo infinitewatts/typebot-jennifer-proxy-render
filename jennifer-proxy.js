@@ -79,11 +79,11 @@ const STAGES = {
 
 const STAGE_INSTRUCTIONS = {
   [STAGES.OPEN]:
-    "STAGE: OPEN. The website widget already showed Jennifer's intro before this chat started. Do NOT introduce yourself again or repeat your name. If their message is just a greeting, reply with one short line like 'what can i help you with today?' If they already asked a question or told you why they're here, answer that directly and move forward. One question only.",
+    "STAGE: OPEN. The website widget already showed Jennifer's intro before this chat started. Do NOT introduce yourself again or repeat your name. If their message is just a greeting, reply with one short line like 'what can i help you with today?' If they already asked a question or told you why they're here, classify the intent and use the matching ADAPTIVE OPENER. One question only.",
   [STAGES.DISCOVER]:
-    "STAGE: DISCOVER. Answer any question they asked using your knowledge, briefly. For pricing questions, say pricing varies based on their energy needs, roof, and equipment. Do NOT say 'we don't quote prices online' and do NOT kick them to Eric immediately. Then ask the one discovery question most relevant to their situation, usually electric company or bill. Don't repeat what they told you. Don't stack questions.",
+    "STAGE: DISCOVER. Answer any question they asked using your knowledge, briefly. Then ask only the highest-value missing question for their intent. Do not sound like a survey. If they ask about equipment, products, panels, inverters, batteries, Enphase, Tesla, Franklin, EG4, warranties, or hail, discover WHY they care before asking utility or bill: high bill, backup power, comparing equipment, reliability, or quotes. For price shoppers, high bills, battery/outage, commercial, quote shoppers, and skeptics, move faster toward Eric once you know bill, utility, property type, or motivation. Don't repeat what they told you. Don't stack questions.",
   [STAGES.COLLECT_NAME]:
-    "STAGE: COLLECT NAME. You have enough to make the handoff. Use one of your PIVOT TO CALL lines from the system prompt, riffed naturally. The frame is: Eric can answer all their questions better than you can in a quick call. Ask for their name. Do not say 'get a quote.' Do not ask anything else.",
+    "STAGE: COLLECT NAME. You have enough to make the handoff. Use one of your PIVOT TO CALL lines from the system prompt, riffed naturally. The frame is: Eric can look at their actual setup and tell them quickly if it makes sense. Ask for their name. Do not say 'get a quote.' Do not ask anything else.",
   [STAGES.COLLECT_PHONE]:
     "STAGE: COLLECT PHONE. You have their name. Ask for the best number to reach them. One sentence only. Do not ask anything else.",
   [STAGES.COLLECT_TIME]:
@@ -111,6 +111,95 @@ function isHistoryAuthorized(queryParams, res) {
   res.writeHead(401, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "unauthorized" }));
   return false;
+}
+
+const INTENTS = {
+  EQUIPMENT: "equipment research",
+  PRICE: "price shopper",
+  HIGH_BILL: "high bill",
+  BATTERY: "battery/outage",
+  QUOTE_SHOPPER: "already has quotes",
+  SKEPTIC: "skeptic",
+  COMMERCIAL: "commercial",
+  NEW_BUILD: "new build",
+  RENTER: "renter",
+  DIRECT_CALL: "direct call",
+  CURIOUS: "curious",
+};
+
+function detectIntent(messages) {
+  const userText = messages
+    .filter((m) => m.role === "user")
+    .map((m) => m.content)
+    .join("\n")
+    .toLowerCase();
+
+  if (!userText.trim()) return INTENTS.CURIOUS;
+  if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|real person)\b/i.test(userText)) return INTENTS.DIRECT_CALL;
+  if (/\b(quote|quoted|quotes|bid|bids|proposal|proposals|another company|other companies|shopping around)\b/i.test(userText)) return INTENTS.QUOTE_SHOPPER;
+  if (/\b(enphase|microinverter|micro.?inverter|inverter|panel|panels|tesla|powerwall|franklin|eg4|ironridge|gaf|battery brand|equipment|warranty|hail)\b/i.test(userText)) return INTENTS.EQUIPMENT;
+  if (/\b(commercial|business|warehouse|office|shop|facility|church|farm|company)\b/i.test(userText)) return INTENTS.COMMERCIAL;
+  if (/\b(new build|new construction|building a|building my|builder|new house|custom home)\b/i.test(userText)) return INTENTS.NEW_BUILD;
+  if (/\b(rent|renter|landlord|apartment|lease)\b/i.test(userText)) return INTENTS.RENTER;
+  if (/\b(battery|backup|outage|outages|grid goes down|off.?grid|storm|ice storm|power went out|generator)\b/i.test(userText)) return INTENTS.BATTERY;
+  if (/\b(scam|rip.?off|waste of money|does it actually save|catch|too good to be true)\b/i.test(userText)) return INTENTS.SKEPTIC;
+  if (/\b(cost|price|pricing|how much|expensive|afford|payment|finance|financing)\b/i.test(userText)) return INTENTS.PRICE;
+  if (/\b(high bill|bill|bills|paying|electric.*killing|rate|rates|OGE|OG&E|PSO)\b/i.test(userText)) return INTENTS.HIGH_BILL;
+  return INTENTS.CURIOUS;
+}
+
+function scoreLead(messages, context, leadData) {
+  const intent = detectIntent(messages);
+  const allUserText = messages
+    .filter((m) => m.role === "user")
+    .map((m) => m.content)
+    .join("\n");
+  let points = 0;
+  const reasons = [];
+
+  if (leadData.phone) {
+    points += 3;
+    reasons.push("phone captured");
+  }
+  if (leadData.name) {
+    points += 1;
+    reasons.push("name captured");
+  }
+  if (leadData.time) {
+    points += 1;
+    reasons.push("call time captured");
+  }
+  if (context.bill) {
+    points += 2;
+    reasons.push("bill shared");
+  }
+  if (context.utility) {
+    points += 1;
+    reasons.push("utility shared");
+  }
+  if (intent === INTENTS.QUOTE_SHOPPER) {
+    points += 3;
+    reasons.push("already comparing quotes");
+  }
+  if (intent === INTENTS.BATTERY) {
+    points += 2;
+    reasons.push("battery or outage need");
+  }
+  if (intent === INTENTS.COMMERCIAL) {
+    points += 2;
+    reasons.push("commercial inquiry");
+  }
+  if (intent === INTENTS.DIRECT_CALL) {
+    points += 2;
+    reasons.push("asked to speak with someone");
+  }
+  if (/\b(ready|asap|soon|this week|today|tomorrow|go ahead|let's do it|lets do it)\b/i.test(allUserText)) {
+    points += 2;
+    reasons.push("urgency or buying signal");
+  }
+
+  const label = points >= 7 ? "HOT" : points >= 4 ? "WARM" : "CASUAL";
+  return { label, points, intent, reasons };
 }
 
 function trimHistory(messages) {
@@ -237,7 +326,6 @@ function importHistoryRecords(records) {
 
 function storeLeadRecord(lead) {
   if (!lead || !lead.sessionId) return false;
-  if (leadsBySession.has(lead.sessionId)) return false;
 
   leadsBySession.set(lead.sessionId, lead);
   const record = JSON.stringify(lead) + "\n";
@@ -518,6 +606,7 @@ function getStage(session) {
   const context = extractContext(session.messages);
   const name = extractName(session.messages);
   const phone = extractPhoneFromSession(session);
+  const intent = detectIntent(session.messages);
 
   if (name) session.leadData.name = name;
   if (phone) session.leadData.phone = phone;
@@ -528,6 +617,7 @@ function getStage(session) {
   if (session.leadData.name && session.leadData.phone && session.leadData.time) return STAGES.CONFIRM;
   if (session.leadData.name && session.leadData.phone && !session.leadData.time) return STAGES.COLLECT_TIME;
   if (session.leadData.name && !session.leadData.phone) return STAGES.COLLECT_PHONE;
+  if (!session.leadData.name && session.leadData.phone) return STAGES.COLLECT_NAME;
 
   // Count how many data points we have
   let dataPoints = 0;
@@ -554,8 +644,22 @@ function getStage(session) {
     return STAGES.COLLECT_NAME;
   }
 
-  // Need at least 4 user messages AND 2+ data points before pivoting to name collection
-  // This ensures enough back-and-forth discovery before asking for contact info
+  const hotIntent = [
+    INTENTS.PRICE,
+    INTENTS.EQUIPMENT,
+    INTENTS.HIGH_BILL,
+    INTENTS.BATTERY,
+    INTENTS.QUOTE_SHOPPER,
+    INTENTS.COMMERCIAL,
+    INTENTS.NEW_BUILD,
+    INTENTS.DIRECT_CALL,
+  ].includes(intent);
+
+  if (hotIntent && dataPoints >= 2 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
+  if ([INTENTS.QUOTE_SHOPPER, INTENTS.DIRECT_CALL].includes(intent) && dataPoints >= 1 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
+
+  // Need more back-and-forth before pivoting casual users.
+  // Serious intent now pivots earlier so Jennifer does not feel like a survey.
   if (dataPoints >= 2 && userMsgCount >= 4) return STAGES.COLLECT_NAME;
 
   // Hard fallback: long conversation with any signal, stop discovering
@@ -878,7 +982,15 @@ function extractTime(messages) {
 }
 
 function extractContext(messages) {
-  const context = { utility: null, bill: null, motivation: null };
+  const context = {
+    utility: null,
+    bill: null,
+    motivation: null,
+    propertyType: null,
+    homeowner: null,
+    city: null,
+    urgency: null,
+  };
   const allUserText = messages
     .filter((m) => m.role === "user")
     .map((m) => m.content.toLowerCase())
@@ -944,6 +1056,25 @@ function extractContext(messages) {
   if (/neighbor|referral|friend/i.test(allUserText))
     motivations.push("referral");
   if (motivations.length > 0) context.motivation = motivations.join(", ");
+
+  if (/\b(commercial|business|warehouse|office|shop|facility|church|company)\b/i.test(allUserText)) {
+    context.propertyType = "commercial";
+  } else if (/\b(house|home|residential|roof)\b/i.test(allUserText)) {
+    context.propertyType = "residential";
+  }
+
+  if (/\b(i own|we own|own my|own our|homeowner|my house|our house)\b/i.test(allUserText)) {
+    context.homeowner = "owns";
+  } else if (/\b(rent|renter|landlord|apartment|lease)\b/i.test(allUserText)) {
+    context.homeowner = "rents";
+  }
+
+  const cityMatch = allUserText.match(/\b(?:in|near|around|out by)\s+(norman|oklahoma city|okc|edmond|moore|mustang|yukon|tulsa|broken arrow|stillwater|lawton|ardmore|shawnee|lake eufaula)\b/i);
+  if (cityMatch) context.city = cityMatch[1].replace(/\bokc\b/i, "OKC");
+
+  if (/\b(asap|soon|this week|today|tomorrow|ready|go ahead|let's do it|lets do it)\b/i.test(allUserText)) {
+    context.urgency = "soon";
+  }
 
   return context;
 }
@@ -1114,27 +1245,40 @@ function summarizeConversation(messages, callback) {
 // --- Lead capture ---
 
 function checkAndSendLead(session, sessionId) {
-  if (session.leadSent) return;
-  if (leadsBySession.has(sessionId)) {
+  const existingLead = leadsBySession.get(sessionId);
+  if (existingLead && existingLead.status === "completed") {
     session.leadSent = true;
     return;
   }
-  if (!session.leadData.name || !session.leadData.phone || !session.leadData.time) return;
+  if (session.leadSent && !existingLead) return;
+  if (!session.leadData.phone) return;
 
   const context = extractContext(session.messages);
+  const leadStatus = session.leadData.name && session.leadData.time ? "completed" : "partial";
+  if (existingLead && existingLead.status === leadStatus) return;
+  const leadScore = scoreLead(session.messages, context, session.leadData);
   session.leadSent = true;
 
   const leadPhone = formatLeadPhone(session.leadData.phone);
-  const leadName = session.leadData.name;
+  const leadName = session.leadData.name || "unknown";
 
   const leadRecord = {
     sessionId,
     name: leadName,
     phone: leadPhone,
-    time: session.leadData.time,
+    time: session.leadData.time || null,
+    status: leadStatus,
+    score: leadScore.label,
+    scorePoints: leadScore.points,
+    intent: leadScore.intent,
+    scoreReasons: leadScore.reasons,
     utility: context.utility || null,
     bill: context.bill || null,
     motivation: context.motivation || null,
+    propertyType: context.propertyType || null,
+    homeowner: context.homeowner || null,
+    city: context.city || null,
+    urgency: context.urgency || null,
     createdAt: new Date().toISOString(),
     source: "jennifer-chat",
   };
@@ -1146,36 +1290,51 @@ function checkAndSendLead(session, sessionId) {
 
   // Build details + summary for Eric — send immediately so he's ready
   const details = [
-    "New lead from chat:",
+    leadStatus === "completed" ? "New lead from chat:" : "Partial lead from chat:",
     "Name: " + leadName,
     "Phone: " + leadPhone,
+    "Score: " + leadScore.label + " (" + leadScore.points + ")",
+    "Intent: " + leadScore.intent,
   ];
   if (context.utility) details.push("Utility: " + context.utility);
   if (context.bill) details.push("Bill: " + context.bill);
   if (context.motivation) details.push("Why: " + context.motivation);
+  if (context.propertyType) details.push("Property: " + context.propertyType);
+  if (context.homeowner) details.push("Homeowner: " + context.homeowner);
+  if (context.city) details.push("City: " + context.city);
+  if (context.urgency) details.push("Urgency: " + context.urgency);
   if (session.leadData.time) details.push("Best time to call: " + session.leadData.time);
 
   summarizeConversation(session.messages, (summary) => {
     const lines = [
-      "<b>New Lead</b>",
+      "<b>" + leadScore.label + " " + (leadStatus === "completed" ? "Lead" : "Partial Lead") + "</b>",
       "<b>Name:</b> " + leadName,
       "<b>Phone:</b> " + leadPhone,
+      "<b>Intent:</b> " + leadScore.intent,
+      "<b>Score:</b> " + leadScore.points,
     ];
+    if (leadScore.reasons.length) lines.push("<b>Why hot:</b> " + leadScore.reasons.join(", "));
     if (context.utility) lines.push("<b>Utility:</b> " + context.utility);
     if (context.bill) lines.push("<b>Bill:</b> " + context.bill);
     if (context.motivation) lines.push("<b>Why:</b> " + context.motivation);
+    if (context.propertyType) lines.push("<b>Property:</b> " + context.propertyType);
+    if (context.homeowner) lines.push("<b>Homeowner:</b> " + context.homeowner);
+    if (context.city) lines.push("<b>City:</b> " + context.city);
+    if (context.urgency) lines.push("<b>Urgency:</b> " + context.urgency);
     if (session.leadData.time) lines.push("<b>Best time:</b> " + session.leadData.time);
     if (summary) lines.push("\n" + summary);
     sendTelegramAlert(lines.join("\n"));
   });
 
   // Text the lead as Eric after a delay — feels human, not instant bot
-  setTimeout(() => {
-    sendIMessage(
-      leadPhone,
-      "hey " + leadName + ", this is Eric with Affordable Solar. jennifer mentioned you had some questions about going solar. do you have a few minutes to chat?"
-    );
-  }, LEAD_TEXT_DELAY);
+  if (leadStatus === "completed") {
+    setTimeout(() => {
+      sendIMessage(
+        leadPhone,
+        "hey " + leadName + ", this is Eric with Affordable Solar. jennifer mentioned you had some questions about going solar. do you have a few minutes to chat?"
+      );
+    }, LEAD_TEXT_DELAY);
+  }
 }
 
 // --- HTTP server ---
@@ -1349,10 +1508,11 @@ const server = http.createServer((req, res) => {
 
         // Quick intercept: if they want to call, give the number immediately
         if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|talk to a person|real person)\b/i.test(userMessage)) {
-          const response = "for sure — give us a call at (405) 400-2836 anytime. our team is here to help.";
+          const response = "for sure, give us a call at (405) 400-2836 anytime. if you want Eric to call you instead, what's your name?";
           if (session) {
             session.messages.push({ role: "assistant", content: response });
             storeHistoryMessage(sessionId, "assistant", response);
+            checkAndSendLead(session, sessionId);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -1385,10 +1545,18 @@ const server = http.createServer((req, res) => {
 
         // Build context summary so Jennifer doesn't re-ask what she already knows
         const knownContext = extractContext(session ? session.messages : []);
+        const knownIntent = detectIntent(session ? session.messages : []);
+        const knownScore = scoreLead(session ? session.messages : [], knownContext, session ? session.leadData : {});
         const knownParts = [];
+        knownParts.push("intent: " + knownIntent);
+        knownParts.push("lead heat: " + knownScore.label);
         if (knownContext.utility) knownParts.push("utility: " + knownContext.utility);
         if (knownContext.bill) knownParts.push("bill: " + knownContext.bill);
         if (knownContext.motivation) knownParts.push("motivation: " + knownContext.motivation);
+        if (knownContext.propertyType) knownParts.push("property: " + knownContext.propertyType);
+        if (knownContext.homeowner) knownParts.push("homeowner: " + knownContext.homeowner);
+        if (knownContext.city) knownParts.push("city: " + knownContext.city);
+        if (knownContext.urgency) knownParts.push("urgency: " + knownContext.urgency);
         const contextNote = knownParts.length > 0
           ? "\n\nWHAT YOU KNOW SO FAR: " + knownParts.join(", ") + ". Do NOT ask about these again."
           : "";
