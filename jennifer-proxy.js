@@ -5,23 +5,43 @@ const { execFile } = require("child_process");
 const path = require("path");
 const os = require("os");
 
-const OLLAMA_HOST = "http://localhost:11434";
-const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
-const OPENROUTER_MODEL = "mistralai/mistral-small-3.2-24b-instruct";
-const PORT = 3090;
+const _PORT = parseInt((process.env.PORT || "3090").trim(), 10);
+const PORT = Number.isInteger(_PORT) && _PORT > 0 ? _PORT : 3090;
 const SESSION_TTL = 30 * 60 * 1000;
 const CLEANUP_INTERVAL = 5 * 60 * 1000;
+const OLLAMA_HOST = (process.env.OLLAMA_HOST || "http://localhost:11434").trim();
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
+const OPENROUTER_MODEL = "mistralai/mistral-small-3.2-24b-instruct";
 const ERIC_PHONE = "+14058182636";
-const LEAD_TEXT_DELAY = 4 * 60 * 1000; // 4 minutes — feels human, lead still warm
+const LEAD_TEXT_DELAY = Number(process.env.LEAD_TEXT_DELAY_MS || "240000");
 const NTFY_URL = "https://ntfy.sh/AffordableSolarLeads";
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_CHAT_ID = "-1003773483505";
 const TELEGRAM_ALERTS_THREAD = 3; // Sales topic
+const LEAD_SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test((process.env.LEAD_SUMMARY_ENABLED || "true").trim());
+const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3:8b").trim();
+const ENABLE_IMESSAGE = /^\s*(1|true|yes|on)\s*$/i.test((process.env.ENABLE_IMESSAGE || "false").trim());
 
-const systemPrompt = fs.readFileSync(
-  "/Users/infinitewatts/typebot/jennifer-system-prompt.txt",
-  "utf8"
-);
+const systemPromptPath = [
+  process.env.JENNIFER_SYSTEM_PROMPT_PATH,
+  path.resolve(__dirname, "jennifer-system-prompt.txt"),
+  path.resolve(process.cwd(), "jennifer-system-prompt.txt"),
+].find((candidate) => {
+  if (!candidate) return false;
+  try {
+    return fs.existsSync(candidate);
+  } catch (_) {
+    return false;
+  }
+});
+
+if (!systemPromptPath) {
+  throw new Error(
+    "System prompt file missing. Set JENNIFER_SYSTEM_PROMPT_PATH to an existing file."
+  );
+}
+
+const systemPrompt = fs.readFileSync(systemPromptPath, "utf8");
 
 const sessions = new Map();
 
@@ -474,6 +494,16 @@ function extractContext(messages) {
 // --- iMessage via osascript ---
 
 function sendIMessage(phone, text) {
+  if (!ENABLE_IMESSAGE) {
+    console.log("Skipping iMessage (ENABLE_IMESSAGE is false)");
+    return;
+  }
+
+  if (os.platform() !== "darwin") {
+    console.log("Skipping iMessage on non-macOS platform", os.platform());
+    return;
+  }
+
   const safeText = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   const script = [
     'tell application "Messages"',
@@ -532,13 +562,18 @@ function formatLeadPhone(digits) {
 // --- Conversation summary via Ollama ---
 
 function summarizeConversation(messages, callback) {
+  if (!LEAD_SUMMARY_ENABLED) {
+    callback(null);
+    return;
+  }
+
   const userMessages = messages
     .filter((m) => m.role === "user")
     .map((m) => m.content)
     .join("\n");
 
   const summaryPrompt = JSON.stringify({
-    model: "qwen3:8b",
+    model: OLLAMA_MODEL,
     messages: [
       {
         role: "system",
