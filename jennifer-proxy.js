@@ -18,6 +18,9 @@ const NTFY_URL = "https://ntfy.sh/AffordableSolarLeads";
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_CHAT_ID = "-1003773483505";
 const TELEGRAM_ALERTS_THREAD = 3; // Sales topic
+const PUSHOVER_API_TOKEN = (process.env.PUSHOVER_API_TOKEN || process.env.PUSHOVER_TOKEN || "").trim();
+const PUSHOVER_USER_KEY = (process.env.PUSHOVER_USER_KEY || process.env.PUSHOVER_USER || "").trim();
+const PUSHOVER_DEVICE = (process.env.PUSHOVER_DEVICE || "").trim();
 const LEAD_SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test((process.env.LEAD_SUMMARY_ENABLED || "true").trim());
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3:8b").trim();
 const ENABLE_IMESSAGE = /^\s*(1|true|yes|on)\s*$/i.test((process.env.ENABLE_IMESSAGE || "false").trim());
@@ -1337,6 +1340,32 @@ function sendNtfyAlert(message) {
   }).catch((e) => console.error("NTFY alert error:", e.message));
 }
 
+function sendPushoverAlert(title, message, options = {}) {
+  if (!PUSHOVER_API_TOKEN || !PUSHOVER_USER_KEY) return;
+
+  const body = new URLSearchParams({
+    token: PUSHOVER_API_TOKEN,
+    user: PUSHOVER_USER_KEY,
+    title: title || "Jennifer Chat Alert",
+    message: stripEmojis(String(message || "")).slice(0, 1024),
+    priority: String(options.priority ?? 0),
+    sound: options.sound || "pushover",
+  });
+
+  if (PUSHOVER_DEVICE) body.set("device", PUSHOVER_DEVICE);
+  if (options.url) body.set("url", options.url);
+  if (options.urlTitle) body.set("url_title", options.urlTitle);
+
+  fetch("https://api.pushover.net/1/messages.json", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  })
+    .then((r) => r.json())
+    .then((d) => console.log("Pushover alert sent, status:", d.status))
+    .catch((e) => console.error("Pushover alert error:", e.message));
+}
+
 function sendNewChatAlert(sessionId, userMessage, clientIp, userAgent) {
   if (!NEW_CHAT_ALERTS_ENABLED || !sessionId) return;
 
@@ -1349,6 +1378,21 @@ function sendNewChatAlert(sessionId, userMessage, clientIp, userAgent) {
       "<b>UA:</b> " + (userAgent || "unknown"),
       "<b>First message:</b> " + (summary || "(empty)"),
     ].join("\n")
+  );
+  sendPushoverAlert(
+    "New website chat",
+    [
+      "New chat started",
+      "Session: " + sessionId,
+      "From: " + (clientIp || "unknown"),
+      "First message: " + (summary || "(empty)"),
+    ].join("\n"),
+    {
+      priority: 0,
+      sound: "pushover",
+      url: "https://jennifer-proxy.onrender.com/history-ui",
+      urlTitle: "Open chat history",
+    }
   );
 
   if (!TELEGRAM_BOT_TOKEN) {
@@ -1488,6 +1532,17 @@ function checkAndSendLead(session, sessionId) {
   if (context.city) details.push("City: " + context.city);
   if (context.urgency) details.push("Urgency: " + context.urgency);
   if (session.leadData.time) details.push("Best time to call: " + session.leadData.time);
+
+  sendPushoverAlert(
+    leadScore.label + " " + (leadStatus === "completed" ? "Jennifer Lead" : "Jennifer Partial Lead"),
+    details.join("\n"),
+    {
+      priority: leadScore.label === "HOT" ? 1 : 0,
+      sound: leadScore.label === "HOT" ? "cashregister" : "pushover",
+      url: "https://jennifer-proxy.onrender.com/history-ui",
+      urlTitle: "Open chat history",
+    }
+  );
 
   summarizeConversation(session.messages, (summary) => {
     const lines = [
