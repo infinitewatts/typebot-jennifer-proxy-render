@@ -21,6 +21,21 @@ const TELEGRAM_ALERTS_THREAD = 3; // Sales topic
 const LEAD_SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test((process.env.LEAD_SUMMARY_ENABLED || "true").trim());
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3:8b").trim();
 const ENABLE_IMESSAGE = /^\s*(1|true|yes|on)\s*$/i.test((process.env.ENABLE_IMESSAGE || "false").trim());
+const CHAT_HISTORY_FILE = path.resolve(
+  process.env.JENNIFER_CHAT_HISTORY_FILE ||
+    path.join(__dirname, "chat-history.jsonl")
+);
+const CHAT_HISTORY_MAX_MESSAGES = Math.max(
+  1,
+  parseInt((process.env.JENNIFER_CHAT_HISTORY_MAX_MESSAGES || "500").trim(), 10) || 500
+);
+const CHAT_HISTORY_ENABLED = !/^(0|false|off|no)$/i.test(
+  (process.env.JENNIFER_CHAT_HISTORY_ENABLED || "true").trim()
+);
+const CHAT_HISTORY_ACCESS_TOKEN = (process.env.CHAT_HISTORY_ACCESS_TOKEN || "").trim();
+const NEW_CHAT_ALERTS_ENABLED = !/^(0|false|off|no)$/i.test(
+  (process.env.JENNIFER_NEW_CHAT_ALERTS || "true").trim()
+);
 
 const systemPromptPath = [
   process.env.JENNIFER_SYSTEM_PROMPT_PATH,
@@ -44,6 +59,7 @@ if (!systemPromptPath) {
 const systemPrompt = fs.readFileSync(systemPromptPath, "utf8");
 
 const sessions = new Map();
+const historyBySession = new Map();
 
 // --- Stage definitions (forward-only) ---
 
@@ -81,6 +97,83 @@ function isGenericGreeting(text) {
   if (!normalized) return false;
 
   return /^(?:hi|hey|hello|howdy|hiya|yo|sup|good morning|good afternoon|good evening)$/.test(normalized);
+}
+
+function isHistoryAuthorized(queryParams, res) {
+  if (!CHAT_HISTORY_ACCESS_TOKEN) return true;
+  const token = queryParams.get("token") || "";
+  if (token === CHAT_HISTORY_ACCESS_TOKEN) return true;
+  res.writeHead(401, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "unauthorized" }));
+  return false;
+}
+
+function trimHistory(messages) {
+  if (messages.length <= CHAT_HISTORY_MAX_MESSAGES) return messages;
+  return messages.slice(messages.length - CHAT_HISTORY_MAX_MESSAGES);
+}
+
+function loadHistoryFromDisk() {
+  if (!CHAT_HISTORY_ENABLED) {
+    console.log("Chat history logging disabled");
+    return;
+  }
+
+  try {
+    if (!fs.existsSync(CHAT_HISTORY_FILE)) return;
+    const raw = fs.readFileSync(CHAT_HISTORY_FILE, "utf8");
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim());
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        if (
+          !parsed ||
+          typeof parsed.sessionId !== "string" ||
+          typeof parsed.role !== "string" ||
+          typeof parsed.content !== "string"
+        ) {
+          continue;
+        }
+        const messages = historyBySession.get(parsed.sessionId) || [];
+        messages.push({
+          role: parsed.role,
+          content: parsed.content,
+          at: parsed.at || new Date().toISOString(),
+        });
+        historyBySession.set(parsed.sessionId, trimHistory(messages));
+      } catch (err) {
+        console.error("Skipping invalid history line:", err.message);
+      }
+    }
+    console.log("Loaded chat history sessions:", historyBySession.size);
+  } catch (err) {
+    console.error("Failed to load chat history:", err.message);
+  }
+}
+
+function storeHistoryMessage(sessionId, role, content) {
+  if (!CHAT_HISTORY_ENABLED || !sessionId) return;
+
+  const messages = historyBySession.get(sessionId) || [];
+  const at = new Date().toISOString();
+  messages.push({ role, content, at });
+  historyBySession.set(sessionId, trimHistory(messages));
+
+  const record = JSON.stringify({ sessionId, role, content, at }) + "\n";
+  fs.appendFile(CHAT_HISTORY_FILE, record, (err) => {
+    if (err) {
+      console.error("History write error:", err.message);
+    }
+  });
+}
+
+function getStoredSessionMessages(sessionId) {
+  if (!CHAT_HISTORY_ENABLED || !sessionId) return [];
+  return (historyBySession.get(sessionId) || []).slice();
+}
+
+function getHistoryPayload(sessionId) {
+  return getStoredSessionMessages(sessionId);
 }
 
 function getStage(session) {
@@ -151,12 +244,31 @@ function getSession(sessionId) {
     session.lastAccess = Date.now();
     return session;
   }
+  const storedMessages = getStoredSessionMessages(sessionId);
+  const lastMessageAt =
+    storedMessages.length > 0 && storedMessages[storedMessages.length - 1].at
+      ? Date.parse(storedMessages[storedMessages.length - 1].at)
+      : 0;
+  const shouldReuseHistory =
+    storedMessages.length > 0 && Date.now() - lastMessageAt < SESSION_TTL;
+  const initialMessages = shouldReuseHistory ? storedMessages : [];
   const newSession = {
-    messages: [],
+    messages: initialMessages,
     lastAccess: Date.now(),
-    leadSent: false,
-    leadData: { name: null, phone: null, time: null },
+    leadSent: shouldReuseHistory
+      ? Boolean(extractName(storedMessages) && extractPhoneFromSession({ messages: storedMessages }) && extractTime(storedMessages))
+      : false,
+    leadData: shouldReuseHistory
+      ? {
+          name: extractName(storedMessages),
+          phone: extractPhoneFromSession({ messages: storedMessages }),
+          time: extractTime(storedMessages),
+        }
+      : { name: null, phone: null, time: null },
     stage: STAGES.OPEN,
+    newChatNotified: false,
+    startedAt: Date.now(),
+    sessionId,
   };
   sessions.set(sessionId, newSession);
   return newSession;
@@ -539,6 +651,7 @@ function sendIMessage(phone, text) {
 }
 
 function sendTelegramAlert(message) {
+  if (!TELEGRAM_BOT_TOKEN) return;
   const body = JSON.stringify({
     chat_id: TELEGRAM_CHAT_ID,
     message_thread_id: TELEGRAM_ALERTS_THREAD,
@@ -553,6 +666,37 @@ function sendTelegramAlert(message) {
     .then((r) => r.json())
     .then((d) => console.log("Telegram alert sent, ok:", d.ok))
     .catch((e) => console.error("Telegram alert error:", e.message));
+}
+
+function sendNtfyAlert(message) {
+  if (!NTFY_URL) return;
+  fetch(NTFY_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain",
+      Title: "Jennifer Chat Alert",
+    },
+    body: message,
+  }).catch((e) => console.error("NTFY alert error:", e.message));
+}
+
+function sendNewChatAlert(sessionId, userMessage, clientIp, userAgent) {
+  if (!NEW_CHAT_ALERTS_ENABLED || !sessionId) return;
+
+  const summary = String(userMessage || "").replace(/\s+/g, " ").trim().slice(0, 240);
+  sendTelegramAlert(
+    [
+      "<b>New chat started</b>",
+      "<b>Session:</b> " + sessionId,
+      "<b>From:</b> " + (clientIp || "unknown"),
+      "<b>UA:</b> " + (userAgent || "unknown"),
+      "<b>First message:</b> " + (summary || "(empty)"),
+    ].join("\n")
+  );
+
+  if (!TELEGRAM_BOT_TOKEN) {
+    sendNtfyAlert(stripEmojis(summary || "New chat started for " + sessionId));
+  }
 }
 
 function formatLeadPhone(digits) {
@@ -690,14 +834,74 @@ function checkAndSendLead(session, sessionId) {
 
 const server = http.createServer((req, res) => {
   console.log(new Date().toISOString(), req.method, req.url);
+  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const pathname = requestUrl.pathname;
 
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  if (req.method === "GET" && pathname === "/history") {
+    if (!isHistoryAuthorized(requestUrl.searchParams, res)) return;
+
+    const sessionId = requestUrl.searchParams.get("sessionId");
+    if (sessionId) {
+      const messages = getHistoryPayload(sessionId);
+      const session = sessions.get(sessionId);
+      const context = extractContext(messages);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          sessionId,
+          messages,
+          leadData: session ? session.leadData : {
+            name: extractName(messages),
+            phone: extractPhoneFromSession({ messages }),
+            time: extractTime(messages),
+            utility: context.utility || null,
+            bill: context.bill || null,
+          },
+          count: messages.length,
+          lastAccess: session ? session.lastAccess : null,
+        })
+      );
+      return;
+    }
+
+    const sessionsSummary = [];
+    for (const [id, messages] of historyBySession.entries()) {
+      const lastMessage = messages[messages.length - 1] || null;
+      sessionsSummary.push({
+        sessionId: id,
+        count: messages.length,
+        lastMessage,
+      });
+    }
+    sessionsSummary.sort((a, b) => {
+      const aTime = new Date((a.lastMessage && a.lastMessage.at) || 0).getTime();
+      const bTime = new Date((b.lastMessage && b.lastMessage.at) || 0).getTime();
+      return bTime - aTime;
+    });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ sessions: sessionsSummary }));
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "Solar chat proxy running" }));
+    return;
+  }
+
+  if (pathname !== "/" && pathname !== "/chat") {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
     return;
   }
 
@@ -710,33 +914,54 @@ const server = http.createServer((req, res) => {
       try {
         const input = JSON.parse(body);
         const userMessage = input.message || "";
-        const sessionId = input.sessionId || null;
+        const sessionId =
+          (typeof input.sessionId === "string" && input.sessionId.trim()) ||
+          `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         if (!userMessage) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               response: "Hey! What can I help you with today?",
-            })
-          );
-          return;
-        }
-
-        // Quick intercept: if they want to call, give the number immediately
-        if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|talk to a person|real person)\b/i.test(userMessage)) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              response: "for sure — give us a call at (405) 400-2836 anytime. our team is here to help.",
+              sessionId,
             })
           );
           return;
         }
 
         const session = getSession(sessionId);
+        const isNewChat = session && session.messages.length === 0 && !session.newChatNotified;
+
+        if (isNewChat) {
+          sendNewChatAlert(
+            sessionId,
+            userMessage,
+            req.socket?.remoteAddress,
+            req.headers["user-agent"]
+          );
+          session.newChatNotified = true;
+        }
 
         if (session) {
           session.messages.push({ role: "user", content: userMessage });
+          storeHistoryMessage(sessionId, "user", userMessage);
+        }
+
+        // Quick intercept: if they want to call, give the number immediately
+        if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|talk to a person|real person)\b/i.test(userMessage)) {
+          const response = "for sure — give us a call at (405) 400-2836 anytime. our team is here to help.";
+          if (session) {
+            session.messages.push({ role: "assistant", content: response });
+            storeHistoryMessage(sessionId, "assistant", response);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              response,
+              sessionId,
+            })
+          );
+          return;
         }
 
         // Determine stage AFTER adding the user message
@@ -817,11 +1042,12 @@ const server = http.createServer((req, res) => {
 
             if (session) {
               session.messages.push({ role: "assistant", content: response });
+              storeHistoryMessage(sessionId, "assistant", response);
               checkAndSendLead(session, sessionId);
             }
 
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ response }));
+            res.end(JSON.stringify({ response, sessionId }));
           } catch (e) {
             console.error("OpenRouter fetch error:", e.message);
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -836,11 +1062,10 @@ const server = http.createServer((req, res) => {
         );
       }
     });
-  } else {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "Solar chat proxy running" }));
   }
 });
+
+loadHistoryFromDisk();
 
 server.listen(PORT, () => {
   console.log("Solar chat proxy listening on port " + PORT);
