@@ -81,7 +81,7 @@ const STAGE_INSTRUCTIONS = {
   [STAGES.OPEN]:
     "STAGE: OPEN. The website widget already showed Jennifer's intro before this chat started. Do NOT introduce yourself again or repeat your name. If their message is just a greeting, reply with one short line like 'what can i help you with today?' If they already asked a question or told you why they're here, classify the intent and use the matching ADAPTIVE OPENER. One question only.",
   [STAGES.DISCOVER]:
-    "STAGE: DISCOVER. Answer any question they asked using your knowledge, briefly. Then ask only the highest-value missing question for their intent. Do not sound like a survey. If they ask about equipment, products, panels, inverters, batteries, Enphase, Tesla, Franklin, EG4, warranties, or hail, discover WHY they care before asking utility or bill: high bill, backup power, comparing equipment, reliability, or quotes. For price shoppers, high bills, battery/outage, commercial, quote shoppers, and skeptics, move faster toward Eric once you know bill, utility, property type, or motivation. Don't repeat what they told you. Don't stack questions.",
+    "STAGE: DISCOVER. Answer any question they asked using your knowledge, briefly. Then ask only the highest-value missing question for their intent. Do not sound like a survey. If they ask about equipment, products, panels, inverters, batteries, Enphase, Tesla, Franklin, EG4, warranties, hail, quotes, or commercial solar, ask a topic-specific open question about why they care before asking utility or bill. Do not ask category-choice questions like bill/backup/comparing options unless they have given two vague answers. For price shoppers and direct call requests, qualify faster. For quote shoppers and equipment shoppers, ask one trust-building discovery question before collecting name. Don't repeat what they told you. Don't stack questions.",
   [STAGES.COLLECT_NAME]:
     "STAGE: COLLECT NAME. You have enough to make the handoff. Use one of your PIVOT TO CALL lines from the system prompt, riffed naturally. The frame is: Eric can look at their actual setup and tell them quickly if it makes sense. Ask for their name. Do not say 'get a quote.' Do not ask anything else.",
   [STAGES.COLLECT_PHONE]:
@@ -146,6 +146,50 @@ function detectIntent(messages) {
   if (/\b(cost|price|pricing|how much|expensive|afford|payment|finance|financing)\b/i.test(userText)) return INTENTS.PRICE;
   if (/\b(high bill|bill|bills|paying|electric.*killing|rate|rates|OGE|OG&E|PSO)\b/i.test(userText)) return INTENTS.HIGH_BILL;
   return INTENTS.CURIOUS;
+}
+
+function isVagueUserMessage(text) {
+  const normalized = String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?,]+/g, "")
+    .replace(/\s+/g, " ");
+  return /^(?:solar|not sure|idk|i dont know|i don't know|just looking|just looking around|curious|maybe|checking|checking around|browsing|researching)$/.test(normalized);
+}
+
+function countVagueUserMessages(messages) {
+  return messages.filter((m) => m.role === "user" && isVagueUserMessage(m.content)).length;
+}
+
+function extractReasonRaw(messages) {
+  const userMessages = messages.filter((m) => m.role === "user").map((m) => String(m.content || "").trim());
+  for (const text of userMessages) {
+    if (!text || isGenericGreeting(text) || isVagueUserMessage(text)) continue;
+    if (extractPhone(text)) continue;
+    if (/^(?:OGE|OG&E|PSO|co-?op)$/i.test(text)) continue;
+    if (/^\$?\d{2,4}(?:\s*(?:a month|monthly|\/mo|per month))?$/i.test(text)) continue;
+    if (/^(?:morning|mornings|afternoon|afternoons|evening|evenings|anytime|after lunch)$/i.test(text)) continue;
+    return text.slice(0, 300);
+  }
+  return null;
+}
+
+function getDiscoveryQuestion(intent, messages) {
+  const vagueCount = countVagueUserMessages(messages);
+  if (vagueCount >= 2) return "what's mostly on your mind, the bill, backup power, or just figuring out whether solar is worth it?";
+
+  if (intent === INTENTS.EQUIPMENT) {
+    if (/\benphase\b/i.test(messages.map((m) => m.content).join("\n"))) return "what got you looking into Enphase specifically?";
+    if (/\bhail\b/i.test(messages.map((m) => m.content).join("\n"))) return "what got you looking at solar even with the hail concern?";
+    return "what got you looking into that equipment specifically?";
+  }
+  if (intent === INTENTS.BATTERY) return "what happened that made you start looking at batteries?";
+  if (intent === INTENTS.QUOTE_SHOPPER) return "what made you unsure about that quote?";
+  if (intent === INTENTS.SKEPTIC) return "what would make solar feel like a bad deal to you?";
+  if (intent === INTENTS.COMMERCIAL) return "what are you hoping solar would change for the business?";
+  if (intent === INTENTS.NEW_BUILD) return "what made you want solar planned into the build from the start?";
+  if (intent === INTENTS.RENTER) return "what got you looking into solar for this place?";
+  return "what got you looking into solar right now?";
 }
 
 function scoreLead(messages, context, leadData) {
@@ -607,6 +651,7 @@ function getStage(session) {
   const name = extractName(session.messages);
   const phone = extractPhoneFromSession(session);
   const intent = detectIntent(session.messages);
+  const reasonRaw = extractReasonRaw(session.messages);
 
   if (name) session.leadData.name = name;
   if (phone) session.leadData.phone = phone;
@@ -655,8 +700,10 @@ function getStage(session) {
     INTENTS.DIRECT_CALL,
   ].includes(intent);
 
-  if (hotIntent && dataPoints >= 2 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
-  if ([INTENTS.QUOTE_SHOPPER, INTENTS.DIRECT_CALL].includes(intent) && dataPoints >= 1 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
+  const needsTrustDiscovery = [INTENTS.EQUIPMENT, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL].includes(intent);
+  if (hotIntent && !needsTrustDiscovery && dataPoints >= 2 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
+  if (needsTrustDiscovery && reasonRaw && dataPoints >= 2 && userMsgCount >= 3) return STAGES.COLLECT_NAME;
+  if (intent === INTENTS.DIRECT_CALL && dataPoints >= 1 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
 
   // Need more back-and-forth before pivoting casual users.
   // Serious intent now pivots earlier so Jennifer does not feel like a survey.
@@ -739,6 +786,10 @@ function stripEmojis(text) {
 
 function postProcess(text, stage, session) {
   let result = stripEmojis(text);
+  const messages = session ? session.messages : [];
+  const intent = detectIntent(messages);
+  const vagueCount = countVagueUserMessages(messages);
+  const hasReason = Boolean(extractReasonRaw(messages));
 
   // Repeat guard: if this response is too similar to the last one, force a redirect
   if (session && session.messages.length >= 2) {
@@ -764,6 +815,12 @@ function postProcess(text, stage, session) {
   // Strip em dashes
   result = result.replace(/\u2014/g, ",").replace(/--/g, ",");
 
+  // Do not reintroduce Jennifer after the widget greeting.
+  result = result
+    .replace(/\bhey there,\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+    .replace(/\bhello,\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+    .trim();
+
   // Strip address/zip asks from any stage
   result = result.replace(/[^.!?]*\b(?:your address|your zip|zip code|share your address|what's your address)\b[^.!?]*[.!?]?/gi, "").trim();
 
@@ -775,6 +832,40 @@ function postProcess(text, stage, session) {
 
   // Strip technical jargon
   result = result.replace(/\bkwh\b/gi, "power").replace(/\bkilowatt.hours?\b/gi, "power");
+
+  // Prevent unsupported hail/stat claims from sounding like verified company history.
+  if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(messages.map((m) => m.content).join("\n"))) {
+    result = result
+      .replace(/[^.!?]*\b\d+(?:\.\d+)?\s*(?:\"|inches?|mph|systems?|years?)\b[^.!?]*[.!?]?/gi, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (!result || !/\?/.test(result)) {
+      result = "hail is a fair concern in Oklahoma. what got you looking at solar even with that worry?";
+    }
+  }
+
+  // Category-choice questions lead the visitor. Use them only after repeated vague answers.
+  if (
+    stage === STAGES.DISCOVER &&
+    vagueCount < 2 &&
+    /(?:bill|backup|comparing options|compare options|lower the bill|cover outages|trying to lower|looking at backup|mostly the bill)/i.test(result) &&
+    /\?/.test(result) &&
+    [INTENTS.EQUIPMENT, INTENTS.BATTERY, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL, INTENTS.CURIOUS].includes(intent)
+  ) {
+    const answerPart = result.split("?")[0].replace(/[^.!]*\b(?:are you|is it|which one|what's mostly)[^.!]*$/i, "").trim();
+    const question = getDiscoveryQuestion(intent, messages);
+    result = (answerPart ? answerPart.replace(/[.?!]*$/, ".") + " " : "") + question;
+  }
+
+  // If the user supplied utility but no real reason yet, avoid treating utility as motivation.
+  if (
+    stage === STAGES.DISCOVER &&
+    !hasReason &&
+    /(?:OGE|OG&E|PSO|electric company|utility)/i.test(messages.filter((m) => m.role === "user").map((m) => m.content).join("\n")) &&
+    /\b(?:bill|backup|comparing|lower|outages)\b/i.test(result)
+  ) {
+    result = "got it. what made you start checking into solar?";
+  }
 
   // CONFIRM stage: no questions allowed
   if (stage === STAGES.CONFIRM) {
@@ -1257,6 +1348,7 @@ function checkAndSendLead(session, sessionId) {
   const leadStatus = session.leadData.name && session.leadData.time ? "completed" : "partial";
   if (existingLead && existingLead.status === leadStatus) return;
   const leadScore = scoreLead(session.messages, context, session.leadData);
+  const reasonRaw = extractReasonRaw(session.messages);
   session.leadSent = true;
 
   const leadPhone = formatLeadPhone(session.leadData.phone);
@@ -1272,6 +1364,7 @@ function checkAndSendLead(session, sessionId) {
     scorePoints: leadScore.points,
     intent: leadScore.intent,
     scoreReasons: leadScore.reasons,
+    reasonRaw,
     utility: context.utility || null,
     bill: context.bill || null,
     motivation: context.motivation || null,
@@ -1296,6 +1389,7 @@ function checkAndSendLead(session, sessionId) {
     "Score: " + leadScore.label + " (" + leadScore.points + ")",
     "Intent: " + leadScore.intent,
   ];
+  if (reasonRaw) details.push("Reason: " + reasonRaw);
   if (context.utility) details.push("Utility: " + context.utility);
   if (context.bill) details.push("Bill: " + context.bill);
   if (context.motivation) details.push("Why: " + context.motivation);
@@ -1314,6 +1408,7 @@ function checkAndSendLead(session, sessionId) {
       "<b>Score:</b> " + leadScore.points,
     ];
     if (leadScore.reasons.length) lines.push("<b>Why hot:</b> " + leadScore.reasons.join(", "));
+    if (reasonRaw) lines.push("<b>Visitor reason:</b> " + reasonRaw);
     if (context.utility) lines.push("<b>Utility:</b> " + context.utility);
     if (context.bill) lines.push("<b>Bill:</b> " + context.bill);
     if (context.motivation) lines.push("<b>Why:</b> " + context.motivation);
@@ -1547,9 +1642,12 @@ const server = http.createServer((req, res) => {
         const knownContext = extractContext(session ? session.messages : []);
         const knownIntent = detectIntent(session ? session.messages : []);
         const knownScore = scoreLead(session ? session.messages : [], knownContext, session ? session.leadData : {});
+        const knownReason = extractReasonRaw(session ? session.messages : []);
         const knownParts = [];
         knownParts.push("intent: " + knownIntent);
         knownParts.push("lead heat: " + knownScore.label);
+        knownParts.push("next discovery question: " + getDiscoveryQuestion(knownIntent, session ? session.messages : []));
+        if (knownReason) knownParts.push("visitor reason in their words: " + knownReason);
         if (knownContext.utility) knownParts.push("utility: " + knownContext.utility);
         if (knownContext.bill) knownParts.push("bill: " + knownContext.bill);
         if (knownContext.motivation) knownParts.push("motivation: " + knownContext.motivation);
