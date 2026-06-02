@@ -151,11 +151,22 @@ function loadHistoryFromDisk() {
   }
 }
 
-function storeHistoryMessage(sessionId, role, content) {
+function hasHistoryRecord(sessionId, role, content, at) {
+  const messages = historyBySession.get(sessionId) || [];
+  return messages.some(
+    (message) =>
+      message.role === role &&
+      message.content === content &&
+      (!at || message.at === at)
+  );
+}
+
+function storeHistoryMessage(sessionId, role, content, atOverride) {
   if (!CHAT_HISTORY_ENABLED || !sessionId) return;
 
   const messages = historyBySession.get(sessionId) || [];
-  const at = new Date().toISOString();
+  const at = atOverride || new Date().toISOString();
+  if (hasHistoryRecord(sessionId, role, content, at)) return;
   messages.push({ role, content, at });
   historyBySession.set(sessionId, trimHistory(messages));
 
@@ -165,6 +176,38 @@ function storeHistoryMessage(sessionId, role, content) {
       console.error("History write error:", err.message);
     }
   });
+}
+
+function importHistoryRecords(records) {
+  let imported = 0;
+  let skipped = 0;
+
+  for (const record of records) {
+    if (!record || typeof record !== "object") {
+      skipped++;
+      continue;
+    }
+
+    const sessionId = typeof record.sessionId === "string" ? record.sessionId.trim() : "";
+    const role = typeof record.role === "string" ? record.role.trim() : "";
+    const content = typeof record.content === "string" ? record.content : "";
+    const at = typeof record.at === "string" && record.at.trim() ? record.at.trim() : undefined;
+
+    if (!sessionId || !role || !content) {
+      skipped++;
+      continue;
+    }
+
+    if (hasHistoryRecord(sessionId, role, content, at)) {
+      skipped++;
+      continue;
+    }
+
+    storeHistoryMessage(sessionId, role, content, at);
+    imported++;
+  }
+
+  return { imported, skipped, sessions: historyBySession.size };
 }
 
 function getStoredSessionMessages(sessionId) {
@@ -1154,6 +1197,41 @@ const server = http.createServer((req, res) => {
   if (req.method !== "POST") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "Solar chat proxy running" }));
+    return;
+  }
+
+  if (pathname === "/history/import") {
+    if (!isHistoryAuthorized(requestUrl.searchParams, res)) return;
+
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 10 * 1024 * 1024) {
+        req.destroy(new Error("history import body too large"));
+      }
+    });
+    req.on("end", () => {
+      try {
+        const input = JSON.parse(body || "[]");
+        const records = Array.isArray(input) ? input : input.records;
+        if (!Array.isArray(records)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "expected JSON array or { records: [...] }" }));
+          return;
+        }
+
+        const result = importHistoryRecords(records);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message || "invalid import payload" }));
+      }
+    });
+    req.on("error", (err) => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message || "import request failed" }));
+    });
     return;
   }
 
