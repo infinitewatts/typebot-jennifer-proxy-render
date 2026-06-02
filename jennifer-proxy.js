@@ -194,6 +194,27 @@ function getDiscoveryQuestion(intent, messages) {
   return "what got you looking into solar right now?";
 }
 
+function getFollowUpQuestion(intent, messages, lastQuestion) {
+  const allUserText = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
+
+  if (intent === INTENTS.EQUIPMENT && /\benphase\b/i.test(allUserText)) {
+    return "what are you trying to avoid with the equipment?";
+  }
+  if (intent === INTENTS.BATTERY) {
+    return "what would you want to keep running if the power went out again?";
+  }
+  if (intent === INTENTS.QUOTE_SHOPPER) {
+    return "what part of the quote felt hardest to trust?";
+  }
+  if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(allUserText)) {
+    return "what would you need to feel comfortable putting panels on the roof?";
+  }
+  if (lastQuestion && /what got you looking into solar right now/i.test(lastQuestion)) {
+    return "what are you hoping solar would change for you?";
+  }
+  return null;
+}
+
 function scoreLead(messages, context, leadData) {
   const intent = detectIntent(messages);
   const allUserText = messages
@@ -758,6 +779,7 @@ function getSession(sessionId) {
       : { name: null, phone: null, time: null },
     stage: STAGES.OPEN,
     newChatNotified: false,
+    askedQuestions: [],
     startedAt: Date.now(),
     sessionId,
   };
@@ -793,6 +815,7 @@ function postProcess(text, stage, session) {
   const vagueCount = countVagueUserMessages(messages);
   const hasReason = Boolean(extractReasonRaw(messages));
   const allUserText = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
+  const askedQuestions = session && Array.isArray(session.askedQuestions) ? session.askedQuestions : [];
 
   // Repeat guard: if this response is too similar to the last one, force a redirect
   if (session && session.messages.length >= 2) {
@@ -889,6 +912,19 @@ function postProcess(text, stage, session) {
   if (discoveryMatches.length > 1) {
     result = result.replace(new RegExp("\\s*" + escapedDiscovery, "i"), "");
   }
+  if (
+    stage === STAGES.DISCOVER &&
+    askedQuestions.some((q) => result.toLowerCase().includes(String(q).toLowerCase()))
+  ) {
+    const repeated = askedQuestions.find((q) => result.toLowerCase().includes(String(q).toLowerCase()));
+    const followUp = getFollowUpQuestion(intent, messages, repeated);
+    if (followUp) {
+      const beforeQuestion = result.split("?")[0].trim();
+      result = (beforeQuestion && !beforeQuestion.toLowerCase().includes(String(repeated).toLowerCase())
+        ? beforeQuestion.replace(/[.?!]*$/, ".") + " "
+        : "") + followUp;
+    }
+  }
 
   if (
     stage === STAGES.DISCOVER &&
@@ -936,7 +972,16 @@ function postProcess(text, stage, session) {
     result = sentences.slice(0, 3).join(" ");
   }
 
-  return result.trim();
+  result = result.trim();
+  if (session && stage === STAGES.DISCOVER && /\?$/.test(result)) {
+    session.askedQuestions = Array.isArray(session.askedQuestions) ? session.askedQuestions : [];
+    if (!session.askedQuestions.includes(result)) {
+      session.askedQuestions.push(result);
+      if (session.askedQuestions.length > 5) session.askedQuestions.shift();
+    }
+  }
+
+  return result;
 }
 
 // --- Lead extraction ---
@@ -1692,6 +1737,9 @@ const server = http.createServer((req, res) => {
         knownParts.push("intent: " + knownIntent);
         knownParts.push("lead heat: " + knownScore.label);
         knownParts.push("next discovery question: " + getDiscoveryQuestion(knownIntent, session ? session.messages : []));
+        if (session && session.askedQuestions && session.askedQuestions.length) {
+          knownParts.push("questions already asked: " + session.askedQuestions.join(" | "));
+        }
         if (knownReason) knownParts.push("visitor reason in their words: " + knownReason);
         if (knownContext.utility) knownParts.push("utility: " + knownContext.utility);
         if (knownContext.bill) knownParts.push("bill: " + knownContext.bill);
