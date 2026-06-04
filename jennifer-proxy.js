@@ -21,6 +21,7 @@ const TELEGRAM_ALERTS_THREAD = 3; // Sales topic
 const PUSHOVER_API_TOKEN = (process.env.PUSHOVER_API_TOKEN || process.env.PUSHOVER_TOKEN || "").trim();
 const PUSHOVER_USER_KEY = (process.env.PUSHOVER_USER_KEY || process.env.PUSHOVER_USER || "").trim();
 const PUSHOVER_DEVICE = (process.env.PUSHOVER_DEVICE || "").trim();
+const PUBLIC_BASE_URL = (process.env.JENNIFER_PUBLIC_BASE_URL || "https://jennifer-proxy.onrender.com").trim().replace(/\/+$/, "");
 const LEAD_SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test((process.env.LEAD_SUMMARY_ENABLED || "true").trim());
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3:8b").trim();
 const ENABLE_IMESSAGE = /^\s*(1|true|yes|on)\s*$/i.test((process.env.ENABLE_IMESSAGE || "false").trim());
@@ -114,6 +115,14 @@ function isHistoryAuthorized(queryParams, res) {
   res.writeHead(401, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "unauthorized" }));
   return false;
+}
+
+function historyUiUrl() {
+  const url = new URL("/history-ui", PUBLIC_BASE_URL);
+  if (CHAT_HISTORY_ACCESS_TOKEN) {
+    url.searchParams.set("token", CHAT_HISTORY_ACCESS_TOKEN);
+  }
+  return url.toString();
 }
 
 const INTENTS = {
@@ -608,7 +617,10 @@ function renderHistoryUi(token) {
     async function loadJson(url) {
       const response = await fetch(url);
       const text = await response.text();
-      if (!response.ok) throw new Error(text || response.statusText);
+      if (!response.ok) {
+        if (response.status === 401) throw new Error("History access token required");
+        throw new Error(text || response.statusText);
+      }
       return text ? JSON.parse(text) : {};
     }
 
@@ -1390,7 +1402,7 @@ function sendNewChatAlert(sessionId, userMessage, clientIp, userAgent) {
     {
       priority: 0,
       sound: "pushover",
-      url: "https://jennifer-proxy.onrender.com/history-ui",
+      url: historyUiUrl(),
       urlTitle: "Open chat history",
     }
   );
@@ -1539,7 +1551,7 @@ function checkAndSendLead(session, sessionId) {
     {
       priority: leadScore.label === "HOT" ? 1 : 0,
       sound: leadScore.label === "HOT" ? "cashregister" : "pushover",
-      url: "https://jennifer-proxy.onrender.com/history-ui",
+      url: historyUiUrl(),
       urlTitle: "Open chat history",
     }
   );
@@ -1598,7 +1610,6 @@ const server = http.createServer((req, res) => {
     req.method === "GET" &&
     (pathname === "/history-ui" || /^\/typebots\/[^/]+\/results$/.test(pathname))
   ) {
-    if (!isHistoryAuthorized(requestUrl.searchParams, res)) return;
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(renderHistoryUi(requestUrl.searchParams.get("token") || ""));
     return;

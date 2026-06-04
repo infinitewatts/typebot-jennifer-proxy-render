@@ -41,6 +41,7 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - `GET /` returns proxy health: `{"status":"Solar chat proxy running"}`
 - `POST /chat` is the website/Typebot webhook endpoint.
 - `GET /history-ui?token=...` opens the hosted chat-history UI.
+- `GET /history-ui` without a token returns the UI shell only; history data still requires the token on `/history` and `/leads`.
 - `GET /history?token=...` returns all chat history as JSON.
 - `GET /history?sessionId=...&token=...` returns one session.
 - `GET /leads?token=...` returns captured partial and completed leads.
@@ -68,6 +69,7 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
   - `Pushover alert sent, status: 1`
 - Telegram delivery is confirmed in Render logs with:
   - `Telegram alert sent, ok: true`
+- Alert links to chat history must include `CHAT_HISTORY_ACCESS_TOKEN` when history protection is enabled.
 
 ## Notes before deploy
 - `jennifer-proxy.js` uses container-safe, repo-relative prompt resolution for `/chat` startup.
@@ -85,6 +87,7 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 3. Smoke tests:
    - `GET /` -> `{"status":"Solar chat proxy running"}`
    - `POST /chat` -> valid JSON response
+   - Better Stack uptime checks should target `GET /` only, not `/history-ui`, `/history`, or local `:3090`.
    - Render logs include `Pushover alert sent, status: 1` after a new-chat test when Pushover is configured.
 4. Verify production hostname target path:
    - `https://jennifer-proxy.onrender.com` (required)
@@ -95,3 +98,6 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - The Render URL is the active production chat proxy.
 - Telegram and Pushover alerts are additive; neither replaces the other.
 - Render filesystem JSONL storage is acceptable for the current lightweight setup, but Postgres or a Render disk is the recommended next durability upgrade if lead/history persistence becomes business-critical.
+- If Render is the active production path, retire the old local `launchd` units for `com.infinitewatts.jennifer-proxy`. Leaving them on with `KeepAlive` can create a local crash loop and noisy monitoring if the `OpenRouter / OPENROUTER_API_KEY` keychain item is missing.
+- Re-enable the local launcher only for intentional local testing, and only after verifying the required `OPENROUTER_API_KEY` keychain secret exists.
+- The local launcher should use the shared BWS runner (`/Users/infinitewatts/secrets-ops/bin/bws-run-profile platform-ops`) rather than direct per-app Keychain secret lookup so it matches the current operator secret-delivery model.

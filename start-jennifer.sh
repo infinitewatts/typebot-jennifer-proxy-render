@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-source "$HOME/.zeroclaw/lib/keychain-env.sh"
-zc_require_keychain || exit 1
-zc_export_required_kc "OpenRouter" "OPENROUTER_API_KEY"
-zc_export_optional_kc "Telegram" "TELEGRAM_BOT_TOKEN"
+BWS_RUNNER="/Users/infinitewatts/secrets-ops/bin/bws-run-profile"
+NODE_BIN="/opt/homebrew/bin/node"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATH_VALUE="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$HOME/.bun/bin"
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$HOME/.bun/bin"
-exec /opt/homebrew/bin/node "$(dirname "$0")/jennifer-proxy.js"
+env_args=("PATH=$PATH_VALUE" "HOME=$HOME")
+for var in PORT JENNIFER_SYSTEM_PROMPT_PATH LEAD_SUMMARY_ENABLED ENABLE_IMESSAGE JENNIFER_NEW_CHAT_ALERTS CHAT_HISTORY_ACCESS_TOKEN JENNIFER_CHAT_HISTORY_FILE JENNIFER_CHAT_LEADS_FILE LEAD_TEXT_DELAY_MS OLLAMA_HOST OLLAMA_MODEL; do
+  if [ "${!var+x}" = x ]; then
+    env_args+=("$var=${!var}")
+  fi
+done
+
+exec "$BWS_RUNNER" platform-ops -- /usr/bin/env "${env_args[@]}" "$NODE_BIN" "$SCRIPT_DIR/jennifer-proxy.js"
