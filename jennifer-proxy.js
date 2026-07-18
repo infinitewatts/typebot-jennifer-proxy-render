@@ -70,7 +70,7 @@ const sessions = new Map();
 const historyBySession = new Map();
 const leadsBySession = new Map();
 
-// --- Stage definitions (forward-only) ---
+// --- Conversation stages ---
 
 const STAGES = {
   OPEN: 1,
@@ -83,17 +83,17 @@ const STAGES = {
 
 const STAGE_INSTRUCTIONS = {
   [STAGES.OPEN]:
-    "STAGE: OPEN. The website widget already showed Jennifer's intro before this chat started. Do NOT introduce yourself again or repeat your name. If their message is just a greeting, reply with one short line like 'what can i help you with today?' If they already asked a question or told you why they're here, classify the intent and use the matching ADAPTIVE OPENER. One question only.",
+    "STATE: OPEN. Answer the visitor's latest message first. The website widget already introduced Jennifer, so do not introduce her again unless the visitor asks who they are talking to. Ask at most one useful follow-up.",
   [STAGES.DISCOVER]:
-    "STAGE: DISCOVER. Answer any question they asked using your knowledge, briefly. Then ask only the highest-value missing question for their intent. Do not sound like a survey. If they ask about equipment, products, panels, inverters, batteries, Enphase, Tesla, Franklin, EG4, warranties, hail, quotes, or commercial solar, ask a topic-specific open question about why they care before asking utility or bill. Do not ask category-choice questions like bill/backup/comparing options unless they have given two vague answers. For price shoppers and direct call requests, qualify faster. For quote shoppers and equipment shoppers, ask one trust-building discovery question before collecting name. Don't repeat what they told you. Don't stack questions.",
+    "STATE: CONVERSATION. Answer the visitor's latest question, correction, or concern directly. Do not assume a premise they did not state. Ask at most one relevant follow-up, and only when it helps.",
   [STAGES.COLLECT_NAME]:
-    "STAGE: COLLECT NAME. You have enough to make the handoff. Use one of your PIVOT TO CALL lines from the system prompt, riffed naturally. The frame is: Eric can look at their actual setup and tell them quickly if it makes sense. Ask for their name. Do not say 'get a quote.' Do not ask anything else.",
+    "CALLBACK STATE: The visitor accepted a callback and their name is missing. Answer their latest message first. If they did not interrupt the callback, ask for their name in one short sentence.",
   [STAGES.COLLECT_PHONE]:
-    "STAGE: COLLECT PHONE. You have their name. Ask for the best number to reach them. One sentence only. Do not ask anything else.",
+    "CALLBACK STATE: The visitor accepted a callback and their phone number is missing. Answer their latest message first. If they did not interrupt the callback, ask for the best number to reach them in one short sentence.",
   [STAGES.COLLECT_TIME]:
-    "STAGE: COLLECT TIME. You have their name and phone. Ask what time of day usually works best for them to get a call. Keep it casual, one short question: 'mornings or afternoons usually better for you?' or 'what time's usually good to catch you?' Do not ask anything else.",
+    "CALLBACK STATE: The visitor accepted a callback and their preferred time is missing. Answer their latest message first. If they did not interrupt the callback, ask what time of day is best in one short sentence.",
   [STAGES.CONFIRM]:
-    "STAGE: DONE. You have their name, phone, and preferred time. Wrap it up. Tell them Eric will reach out at that time and he'll have everything he needs, they won't have to start from scratch. Do NOT ask any questions. End with a period.",
+    "CALLBACK STATE: Name, phone, and preferred time are confirmed. Answer the latest message first, then briefly confirm that Eric will reach out. The conversation remains open for questions.",
 };
 
 function isGenericGreeting(text) {
@@ -106,6 +106,27 @@ function isGenericGreeting(text) {
   if (!normalized) return false;
 
   return /^(?:hi|hey|hello|howdy|hiya|yo|sup|good morning|good afternoon|good evening)$/.test(normalized);
+}
+
+function isDirectCallRequest(text) {
+  const value = String(text || "");
+  if (isIdentityQuestion(value)) return false;
+  if (/\b(?:do not|don't|dont|never|no longer)\b[^.!?]{0,60}\b(?:call|phone number|talk|speak|contact|real person|human)\b/i.test(value)) return false;
+  return /\b(?:can i call|just call|rather call|want to call|phone number|(?:can i |let me |want to |rather )?(?:talk|speak) to (?:someone|a person|a real person|a human)|real person please)\b/i.test(value);
+}
+
+function getDirectCallResponse() {
+  return "You can call us at (405) 400-2836.";
+}
+
+function isIdentityQuestion(text) {
+  const value = String(text || "");
+  return /\b(?:are you|is this)\b[^.!?]{0,50}\b(?:ai|bot|chatbot|human|real person)\b/i.test(value) ||
+    /\b(?:who|what) (?:am i|are we) (?:talking|chatting) (?:to|with)\b/i.test(value);
+}
+
+function getIdentityResponse() {
+  return "I'm Affordable Solar's AI website assistant. I can help here, or arrange a callback from Eric if you'd rather speak with a person.";
 }
 
 function isHistoryAuthorized(queryParams, res) {
@@ -130,6 +151,7 @@ const INTENTS = {
   PRICE: "price shopper",
   HIGH_BILL: "high bill",
   BATTERY: "battery/outage",
+  OFF_GRID: "off-grid/energy independence",
   QUOTE_SHOPPER: "already has quotes",
   SKEPTIC: "skeptic",
   COMMERCIAL: "commercial",
@@ -139,24 +161,29 @@ const INTENTS = {
   CURIOUS: "curious",
 };
 
-function detectIntent(messages) {
-  const userText = messages
-    .filter((m) => m.role === "user")
-    .map((m) => m.content)
-    .join("\n")
-    .toLowerCase();
+function classifyIntent(text) {
+  const value = String(text || "");
+  if (!value.trim()) return INTENTS.CURIOUS;
+  if (/\b(cost|price|pricing|how much|expensive|afford|payment|finance|financing)\b/i.test(value)) return INTENTS.PRICE;
+  if (isDirectCallRequest(value)) return INTENTS.DIRECT_CALL;
+  if (/\b(quote|quoted|quotes|bid|bids|proposal|proposals|another company|other companies|shopping around)\b/i.test(value)) return INTENTS.QUOTE_SHOPPER;
+  if (/\b(off.?grid|energy independence|independent of (?:the )?(?:grid|power company|utility)|self.?sufficient|(?:do not|don't|dont|not) (?:want to )?rely on (?:a |the )?(?:grid|power company|utility))\b/i.test(value)) return INTENTS.OFF_GRID;
+  if (/\b(battery|batteries|backup|outage|outages|grid goes down|storm|ice storm|power went out|generator)\b/i.test(value)) return INTENTS.BATTERY;
+  if (/\b(enphase|microinverter|micro.?inverter|inverter|panel|panels|tesla|powerwall|franklin|eg4|ironridge|gaf|battery brand|equipment|warranty|hail)\b/i.test(value)) return INTENTS.EQUIPMENT;
+  if (/\b(commercial|business|warehouse|office|shop|facility|church|farm|my company|our company)\b/i.test(value)) return INTENTS.COMMERCIAL;
+  if (/\b(new build|new construction|building a|building my|builder|new house|custom home)\b/i.test(value)) return INTENTS.NEW_BUILD;
+  if (/\b(rent|renter|landlord|apartment|lease)\b/i.test(value)) return INTENTS.RENTER;
+  if (/\b(scam|rip.?off|waste of money|does it actually save|catch|too good to be true)\b/i.test(value)) return INTENTS.SKEPTIC;
+  if (/\b(high bill|bill|bills|paying|electric.*killing|rate|rates|OGE|OG&E|PSO)\b/i.test(value)) return INTENTS.HIGH_BILL;
+  return INTENTS.CURIOUS;
+}
 
-  if (!userText.trim()) return INTENTS.CURIOUS;
-  if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|real person)\b/i.test(userText)) return INTENTS.DIRECT_CALL;
-  if (/\b(quote|quoted|quotes|bid|bids|proposal|proposals|another company|other companies|shopping around)\b/i.test(userText)) return INTENTS.QUOTE_SHOPPER;
-  if (/\b(battery|batteries|backup|outage|outages|grid goes down|off.?grid|storm|ice storm|power went out|generator)\b/i.test(userText)) return INTENTS.BATTERY;
-  if (/\b(enphase|microinverter|micro.?inverter|inverter|panel|panels|tesla|powerwall|franklin|eg4|ironridge|gaf|battery brand|equipment|warranty|hail)\b/i.test(userText)) return INTENTS.EQUIPMENT;
-  if (/\b(commercial|business|warehouse|office|shop|facility|church|farm|company)\b/i.test(userText)) return INTENTS.COMMERCIAL;
-  if (/\b(new build|new construction|building a|building my|builder|new house|custom home)\b/i.test(userText)) return INTENTS.NEW_BUILD;
-  if (/\b(rent|renter|landlord|apartment|lease)\b/i.test(userText)) return INTENTS.RENTER;
-  if (/\b(scam|rip.?off|waste of money|does it actually save|catch|too good to be true)\b/i.test(userText)) return INTENTS.SKEPTIC;
-  if (/\b(cost|price|pricing|how much|expensive|afford|payment|finance|financing)\b/i.test(userText)) return INTENTS.PRICE;
-  if (/\b(high bill|bill|bills|paying|electric.*killing|rate|rates|OGE|OG&E|PSO)\b/i.test(userText)) return INTENTS.HIGH_BILL;
+function detectIntent(messages) {
+  const userMessages = messages.filter((message) => message.role === "user");
+  for (let index = userMessages.length - 1; index >= 0; index--) {
+    const intent = classifyIntent(userMessages[index].content);
+    if (intent !== INTENTS.CURIOUS) return intent;
+  }
   return INTENTS.CURIOUS;
 }
 
@@ -169,60 +196,22 @@ function isVagueUserMessage(text) {
   return /^(?:solar|not sure|idk|i dont know|i don't know|just looking|just looking around|curious|maybe|checking|checking around|browsing|researching)$/.test(normalized);
 }
 
-function countVagueUserMessages(messages) {
-  return messages.filter((m) => m.role === "user" && isVagueUserMessage(m.content)).length;
-}
-
 function extractReasonRaw(messages) {
-  const userMessages = messages.filter((m) => m.role === "user").map((m) => String(m.content || "").trim());
-  for (const text of userMessages) {
+  const userMessages = messages.filter((message) => message.role === "user").reverse();
+  for (const message of userMessages) {
+    const text = String(message.content || "").trim();
     if (!text || isGenericGreeting(text) || isVagueUserMessage(text)) continue;
+    if (/\?|^(?:who|what|when|where|why|how|do|does|did|is|are|can|could|would|will|should)\b/i.test(text)) continue;
     if (extractPhone(text)) continue;
     if (/^(?:OGE|OG&E|PSO|co-?op)$/i.test(text)) continue;
     if (/^\$?\d{2,4}(?:\s*(?:a month|monthly|\/mo|per month))?$/i.test(text)) continue;
-    if (/^(?:morning|mornings|afternoon|afternoons|evening|evenings|anytime|after lunch)$/i.test(text)) continue;
-    if (/^(?:do you|do y'all|do you all|can i|how much|what does|is solar|are panels|does solar)\b/i.test(text)) continue;
+    if (/^(?:morning|mornings|afternoon|afternoons|evening|evenings|anytime|any time|after lunch|\d{1,2}(?::\d{2})?\s*(?:am|pm))$/i.test(text)) continue;
+    const selfIdentification = text.match(
+      /^(?:my name is|call me)\s+([^,.!?]+)[,.!?]?$/i
+    );
+    if (selfIdentification && looksLikeName(selfIdentification[1])) continue;
     if (/^(?:house|home|warehouse|business)\s+(?:in|near)\b/i.test(text)) continue;
     return text.slice(0, 300);
-  }
-  return null;
-}
-
-function getDiscoveryQuestion(intent, messages) {
-  const vagueCount = countVagueUserMessages(messages);
-  if (vagueCount >= 2) return "what's mostly on your mind, the bill, backup power, or just figuring out whether solar is worth it?";
-
-  if (intent === INTENTS.EQUIPMENT) {
-    if (/\benphase\b/i.test(messages.map((m) => m.content).join("\n"))) return "what got you looking into Enphase specifically?";
-    if (/\bhail\b/i.test(messages.map((m) => m.content).join("\n"))) return "what got you looking at solar even with the hail concern?";
-    return "what got you looking into that equipment specifically?";
-  }
-  if (intent === INTENTS.BATTERY) return "what happened that made you start looking at batteries?";
-  if (intent === INTENTS.QUOTE_SHOPPER) return "what part of the quote made you want a second opinion?";
-  if (intent === INTENTS.SKEPTIC) return "what would make solar feel like a bad deal to you?";
-  if (intent === INTENTS.COMMERCIAL) return "what are you hoping solar would change for the business?";
-  if (intent === INTENTS.NEW_BUILD) return "what made you want solar planned into the build from the start?";
-  if (intent === INTENTS.RENTER) return "what got you looking into solar for this place?";
-  return "what got you looking into solar right now?";
-}
-
-function getFollowUpQuestion(intent, messages, lastQuestion) {
-  const allUserText = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
-
-  if (intent === INTENTS.EQUIPMENT && /\benphase\b/i.test(allUserText)) {
-    return "what are you trying to avoid with the equipment?";
-  }
-  if (intent === INTENTS.BATTERY) {
-    return "what would you want to keep running if the power went out again?";
-  }
-  if (intent === INTENTS.QUOTE_SHOPPER) {
-    return "what part of the quote felt hardest to trust?";
-  }
-  if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(allUserText)) {
-    return "what would you need to feel comfortable putting panels on the roof?";
-  }
-  if (lastQuestion && /what got you looking into solar right now/i.test(lastQuestion)) {
-    return "what are you hoping solar would change for you?";
   }
   return null;
 }
@@ -684,82 +673,140 @@ function renderHistoryUi(token) {
 </html>`;
 }
 
-function getStage(session) {
-  const context = extractContext(session.messages);
-  const name = extractName(session.messages);
-  const phone = extractPhoneFromSession(session);
-  const intent = detectIntent(session.messages);
-  const reasonRaw = extractReasonRaw(session.messages);
+function getLatestUserMessage(messages) {
+  return [...messages].reverse().find((message) => message.role === "user") || null;
+}
 
-  if (name) session.leadData.name = name;
-  if (phone) session.leadData.phone = phone;
+function isCallbackWithdrawal(text) {
+  return /\b(?:do not|don't|dont|never mind|nevermind|cancel)\b[^.!?]{0,40}\b(?:call|contact|reach out|callback)\b|\b(?:do not|don't|dont) call me\b/i.test(
+    String(text || "")
+  );
+}
 
-  const time = extractTime(session.messages);
-  if (time) session.leadData.time = time;
+function isConversationInterruption(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  return isIdentityQuestion(value) ||
+    value.includes("?") ||
+    /^(?:no\b|actually\b|i mean\b|that's not\b|that isn't\b|you misunderstood\b|not what i\b)/i.test(value) ||
+    /\b(?:not sure|hold on|one sec|give me a minute|let me think|not ready|maybe later|another question|no thanks|not interested)\b/i.test(value);
+}
 
-  if (session.leadData.name && session.leadData.phone && session.leadData.time) return STAGES.CONFIRM;
-  if (session.leadData.name && session.leadData.phone && !session.leadData.time) return STAGES.COLLECT_TIME;
-  if (session.leadData.name && !session.leadData.phone) return STAGES.COLLECT_PHONE;
-  if (!session.leadData.name && session.leadData.phone) return STAGES.COLLECT_NAME;
+function assistantOfferedCallback(text) {
+  const value = String(text || "");
+  return /\bwould you like to (?:speak|talk) (?:to|with) (?:Eric|an? advisor|someone)\b|\bwould you like\b[^.!?]{0,60}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,40}\b(?:call|contact|reach out)\b|\b(?:i|we) can have\b[^.!?]{0,30}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:call|contact|reach out)\b|\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:can|could|will|would)\b[^.!?]{0,20}\b(?:call|contact|reach out)\b|\b(?:want|like) (?:a )?callback\b|\barrange (?:a )?(?:call|callback)\b/i.test(value);
+}
 
-  // Count how many data points we have
-  let dataPoints = 0;
-  if (context.utility) dataPoints++;
-  if (context.bill) dataPoints++;
-  if (context.motivation) dataPoints++;
+function explicitlyAcceptsCallback(text) {
+  const value = String(text || "");
+  const callMeName = value.match(/^call me\s+([^,.!?]+)[,.!?]?$/i);
+  if (callMeName && !extractPhone(value) && looksLikeName(callMeName[1])) return false;
+  return /\b(?:call me|give me a call|have (?:Eric|him|someone) call|you can call|please call|i(?:'d| would) like (?:a )?call|reach out to me|contact me)\b/i.test(value);
+}
 
-  const userMessages = session.messages.filter((m) => m.role === "user");
-  const userMsgCount = userMessages.length;
-  const firstUserMsg = userMessages[0]?.content || "";
-  const lastUserMsg = userMessages[userMsgCount - 1];
-  const assistantMessages = session.messages.filter((m) => m.role === "assistant");
-  const lastAssistantMsg = assistantMessages[assistantMessages.length - 1];
+function inferCallbackAcceptance(messages) {
+  let accepted = false;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
 
-  // Buying signal: user gives a short affirmation after Jennifer offers to get a quote/plan/advisor
-  if (
-    dataPoints >= 1 &&
-    session.messages.length >= 4 &&
-    lastUserMsg &&
-    lastAssistantMsg &&
-    /^(?:ok|okay|sure|sounds good|go ahead|great|alright|yeah|yes|yep|perfect)\.?$/i.test(lastUserMsg.content.trim()) &&
-    /(?:quote|setup|plan|advisor|reach out|look into|call you|set.*up)/i.test(lastAssistantMsg.content)
-  ) {
-    return STAGES.COLLECT_NAME;
+    const text = String(message.content || "");
+    if (isCallbackWithdrawal(text)) {
+      accepted = false;
+      continue;
+    }
+    if (explicitlyAcceptsCallback(text)) {
+      accepted = true;
+      continue;
+    }
+
+    const previous = messages[index - 1];
+    if (
+      extractPhone(text) &&
+      previous?.role === "assistant" &&
+      assistantOfferedCallback(previous.content)
+    ) {
+      accepted = true;
+      continue;
+    }
+    const directName = text
+      .trim()
+      .replace(/^(?:my name is|i'm|i am|this is|call me)\s+/i, "")
+      .replace(/[.!,]+$/, "")
+      .trim();
+    if (
+      previous?.role === "assistant" &&
+      assistantOfferedCallback(previous.content) &&
+      (/^(?:yes|yeah|yep|sure|okay|ok|go ahead|sounds good)\b/i.test(text.trim()) ||
+        (/\b(?:what's your name|your name|name and number)\b/i.test(previous.content) &&
+          !isConversationInterruption(text) &&
+          looksLikeName(directName)))
+    ) {
+      accepted = true;
+    }
+  }
+  return accepted;
+}
+
+function captureLeadFields(session) {
+  session.leadData = session.leadData || { name: null, phone: null, time: null };
+  const inferredAcceptance = inferCallbackAcceptance(session.messages);
+
+  if (session.callbackAccepted == null) {
+    session.callbackAccepted =
+      (session.stage >= STAGES.COLLECT_NAME && session.stage <= STAGES.CONFIRM) ||
+      inferredAcceptance;
+  } else if (inferredAcceptance) {
+    session.callbackAccepted = true;
   }
 
-  const hotIntent = [
-    INTENTS.PRICE,
-    INTENTS.EQUIPMENT,
-    INTENTS.HIGH_BILL,
-    INTENTS.BATTERY,
-    INTENTS.QUOTE_SHOPPER,
-    INTENTS.COMMERCIAL,
-    INTENTS.NEW_BUILD,
-    INTENTS.DIRECT_CALL,
-  ].includes(intent);
+  if (!session.callbackAccepted) return;
 
-  const needsTrustDiscovery = [INTENTS.EQUIPMENT, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL].includes(intent);
-  if (hotIntent && !needsTrustDiscovery && dataPoints >= 2 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
-  if (needsTrustDiscovery && reasonRaw && dataPoints >= 2 && userMsgCount >= 3) return STAGES.COLLECT_NAME;
-  if (intent === INTENTS.DIRECT_CALL && dataPoints >= 1 && userMsgCount >= 2) return STAGES.COLLECT_NAME;
+  const name = extractName(session.messages);
+  const phone = extractPhoneFromSession(session);
+  const time = extractTime(session.messages);
+  if (name) session.leadData.name = name;
+  if (phone) session.leadData.phone = phone;
+  if (time) session.leadData.time = time;
+}
 
-  // Need more back-and-forth before pivoting casual users.
-  // Serious intent now pivots earlier so Jennifer does not feel like a survey.
-  if (dataPoints >= 2 && userMsgCount >= 4) return STAGES.COLLECT_NAME;
+function getStage(session) {
+  captureLeadFields(session);
 
-  // Hard fallback: long conversation with any signal, stop discovering
-  if (userMsgCount >= 8 && dataPoints >= 1) return STAGES.COLLECT_NAME;
-  if (userMsgCount >= 11) return STAGES.COLLECT_NAME;
+  if (session.callbackAccepted) {
+    if (session.leadData.name && session.leadData.phone && session.leadData.time) {
+      return session.callbackConfirmed ? STAGES.DISCOVER : STAGES.CONFIRM;
+    }
+    if (!session.leadData.name) return STAGES.COLLECT_NAME;
+    if (!session.leadData.phone) return STAGES.COLLECT_PHONE;
+    return STAGES.COLLECT_TIME;
+  }
 
-  if (userMsgCount === 1) {
-    if (isGenericGreeting(firstUserMsg)) return STAGES.OPEN;
+  const userMessages = session.messages.filter((message) => message.role === "user");
+  if (userMessages.length === 1 && isGenericGreeting(userMessages[0].content)) return STAGES.OPEN;
+  return userMessages.length ? STAGES.DISCOVER : STAGES.OPEN;
+}
+
+function getActiveStage(session) {
+  if (!session) return STAGES.OPEN;
+
+  const latestUser = getLatestUserMessage(session.messages);
+  const latestText = latestUser?.content || "";
+  if (isCallbackWithdrawal(latestText)) {
+    session.callbackAccepted = false;
+    session.callbackConfirmed = false;
+    if (session.leadTextTimer) {
+      clearTimeout(session.leadTextTimer);
+      session.leadTextTimer = null;
+    }
     return STAGES.DISCOVER;
   }
 
-  // If we have any conversation history beyond the first exchange, we're discovering
-  if (session.messages.length >= 2) return STAGES.DISCOVER;
+  const stage = getStage(session);
+  if (isConversationInterruption(latestText)) return STAGES.DISCOVER;
 
-  return STAGES.OPEN;
+  session.stage = stage;
+  return stage;
 }
 
 // --- Session management ---
@@ -779,22 +826,25 @@ function getSession(sessionId) {
   const shouldReuseHistory =
     storedMessages.length > 0 && Date.now() - lastMessageAt < SESSION_TTL;
   const initialMessages = shouldReuseHistory ? storedMessages : [];
+  const storedCallbackAccepted = shouldReuseHistory
+    ? inferCallbackAcceptance(storedMessages)
+    : false;
+  const storedName = storedCallbackAccepted ? extractName(storedMessages) : null;
+  const storedPhone = storedCallbackAccepted
+    ? extractPhoneFromSession({ messages: storedMessages })
+    : null;
+  const storedTime = storedCallbackAccepted ? extractTime(storedMessages) : null;
   const newSession = {
     messages: initialMessages,
     lastAccess: Date.now(),
     leadSent: shouldReuseHistory
-      ? Boolean(extractName(storedMessages) && extractPhoneFromSession({ messages: storedMessages }) && extractTime(storedMessages))
+      ? Boolean(storedName && storedPhone && storedTime)
       : false,
-    leadData: shouldReuseHistory
-      ? {
-          name: extractName(storedMessages),
-          phone: extractPhoneFromSession({ messages: storedMessages }),
-          time: extractTime(storedMessages),
-        }
-      : { name: null, phone: null, time: null },
+    leadData: { name: storedName, phone: storedPhone, time: storedTime },
+    callbackAccepted: storedCallbackAccepted,
+    callbackConfirmed: Boolean(storedName && storedPhone && storedTime),
     stage: STAGES.OPEN,
     newChatNotified: false,
-    askedQuestions: [],
     startedAt: Date.now(),
     sessionId,
   };
@@ -802,16 +852,94 @@ function getSession(sessionId) {
   return newSession;
 }
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.lastAccess > SESSION_TTL) {
-      sessions.delete(id);
+function startSessionCleanup() {
+  const timer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of sessions) {
+      if (now - session.lastAccess > SESSION_TTL) {
+        sessions.delete(id);
+      }
     }
-  }
-}, CLEANUP_INTERVAL);
+  }, CLEANUP_INTERVAL);
+  timer.unref();
+}
 
 // --- Post-processing ---
+
+function normalizeReplyText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/\bwhat's\b/g, "what is")
+    .replace(/[^a-z0-9']+/g, " ")
+    .trim();
+}
+
+function getQuestionClauses(text) {
+  return String(text || "")
+    .split("?")
+    .slice(0, -1)
+    .map((part) => normalizeReplyText(part.split(/[.!]/).pop()))
+    .filter(Boolean);
+}
+
+function isRepeatedReply(currentText, messages) {
+  const current = normalizeReplyText(currentText);
+  if (!current) return false;
+  const currentQuestions = getQuestionClauses(currentText);
+
+  for (const message of messages || []) {
+    if (message.role !== "assistant") continue;
+    if (normalizeReplyText(message.content) === current) return true;
+
+    const previousQuestions = new Set(getQuestionClauses(message.content));
+    if (currentQuestions.some((question) => previousQuestions.has(question))) return true;
+  }
+  return false;
+}
+
+function removeRepeatedQuestions(text, messages) {
+  const previousQuestions = new Set(
+    (messages || [])
+      .filter((message) => message.role === "assistant")
+      .flatMap((message) => getQuestionClauses(message.content))
+  );
+  if (previousQuestions.size === 0) return String(text || "").trim();
+
+  return String(text || "")
+    .replace(
+      /(^|[.!]\s+|,\s+)((?:what|why|how|who|when|where|do|does|did|is|are|can|could|would|will|should|may)\b[^?]*\?)/gi,
+      (match, prefix, question) => {
+        if (!previousQuestions.has(normalizeReplyText(question))) return match;
+        if (prefix.startsWith(",")) return ".";
+        if (prefix.startsWith(".") || prefix.startsWith("!")) return prefix[0];
+        return "";
+      }
+    )
+    .replace(/\s{2,}/g, " ")
+    .replace(/\.{2,}/g, ".")
+    .trim();
+}
+
+function needsModelRetry(cleanedText, messages) {
+  return !String(cleanedText || "").trim() || isRepeatedReply(cleanedText, messages);
+}
+
+function getNonRepeatedRecovery(messages) {
+  const candidates = [
+    "I didn't answer that well. Could you rephrase your latest question?",
+    "I lost the thread. What should I answer first?",
+    "I missed your point. What would you like me to address?",
+  ];
+  const available = candidates.find((candidate) => !isRepeatedReply(candidate, messages));
+  if (available) return available;
+
+  let recovery = "I need a fresh wording before I can answer accurately.";
+  while (isRepeatedReply(recovery, messages)) {
+    recovery += " Please rephrase it.";
+  }
+  return recovery;
+}
 
 function stripEmojis(text) {
   return text
@@ -823,44 +951,28 @@ function stripEmojis(text) {
     .trim();
 }
 
-function postProcess(text, stage, session) {
+function postProcess(text, _stage, session) {
   let result = stripEmojis(text);
   const messages = session ? session.messages : [];
-  const intent = detectIntent(messages);
-  const vagueCount = countVagueUserMessages(messages);
-  const hasReason = Boolean(extractReasonRaw(messages));
   const allUserText = messages.filter((m) => m.role === "user").map((m) => m.content).join("\n");
-  const askedQuestions = session && Array.isArray(session.askedQuestions) ? session.askedQuestions : [];
-
-  // Repeat guard: if this response is too similar to the last one, force a redirect
-  if (session && session.messages.length >= 2) {
-    const lastAssistant = [...session.messages].reverse().find((m) => m.role === "assistant");
-    if (lastAssistant) {
-      const similarity = lastAssistant.content.toLowerCase().trim();
-      const current = result.toLowerCase().trim();
-      if (similarity === current || current.includes(similarity.slice(0, Math.min(similarity.length, 40)))) {
-        // Response is a repeat. Replace with a stage-appropriate redirect.
-        if (stage === STAGES.COLLECT_NAME) {
-          result = "let me have one of our energy advisors look into this for you. what's your name?";
-        } else if (stage === STAGES.COLLECT_PHONE) {
-          result = "what's the best number to reach you at?";
-        } else if (stage === STAGES.DISCOVER) {
-          result = "so I can get you the right info, what's your monthly electric bill roughly?";
-        } else {
-          result = "tell me a bit more about what you're looking for.";
-        }
-      }
-    }
-  }
 
   // Strip em dashes
   result = result.replace(/\u2014/g, ",").replace(/--/g, ",");
 
   // Do not reintroduce Jennifer after the widget greeting.
-  result = result
-    .replace(/^\s*(?:hi|hey|hello)(?: there)?,?\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
-    .replace(/\bi['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
-    .trim();
+  if (!isIdentityQuestion(getLatestUserMessage(messages)?.content)) {
+    result = result
+      .replace(/^\s*(?:hi|hey|hello)(?: there)?,?\s*i['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+      .replace(/\bi['’]?m jennifer(?: with affordable solar(?: in norman)?)?\.?\s*/gi, "")
+      .trim();
+  }
+
+  if (
+    isIdentityQuestion(getLatestUserMessage(messages)?.content) &&
+    /\b(?:(?:i am|i'm|we are|we're) (?:a )?(?:real person|human)|(?:i am|i'm|we are|we're) not (?:an? )?(?:ai|bot|chatbot)|not (?:an? )?(?:ai|bot|chatbot))\b/i.test(result)
+  ) {
+    result = getIdentityResponse();
+  }
 
   // Strip address/zip asks from any stage
   result = result.replace(/[^.!?]*\b(?:your address|your zip|zip code|share your address|what's your address)\b[^.!?]*[.!?]?/gi, "").trim();
@@ -868,16 +980,16 @@ function postProcess(text, stage, session) {
   // Strip link/form/online-scheduling mentions (but NOT casual time preference questions)
   result = result.replace(/[^.!?]*\b(?:send you a link|text you a link|quote form|schedule (?:a )?(?:consultation|visit|appointment)|sign up for|fill out|online calendar|booking link)\b[^.!?]*[.!?]?/gi, "").trim();
 
+  // The site can offer an office call or callback, not a live transfer.
+  result = result.replace(/[^.!?]*\b(?:connect you (?:now|live|directly)|transfer you|put you through)\b[^.!?]*[.!?]?/gi, "").trim();
+
   // Strip ITC/tax credit mentions
   result = result.replace(/[^.!?]*\b(?:ITC|tax credit|federal incentive|federal tax|investment tax)\b[^.!?]*[.!?]?/gi, "").trim();
-
-  // Strip technical jargon
-  result = result.replace(/\bkwh\b/gi, "power").replace(/\bkilowatt.hours?\b/gi, "power");
 
   // Prevent unsupported technical, sizing, offset, and hail/stat claims from sounding verified.
   result = result
     .replace(/[^.!?]*\b\d+\s*[- ]?panel system\b[^.!?]*[.!?]?/gi, "")
-    .replace(/[^.!?]*\b(?:offset percentage|100%\s*offset|blended rate)\b[^.!?]*[.!?]?/gi, "")
+    .replace(/[^.!?]*\b(?:offset percentage|100%\s*offset)\b[^.!?]*[.!?]?/gi, "")
     .replace(/[^.!?]*\bwe(?:'|’)?ve yet to see\b[^.!?]*[.!?]?/gi, "")
     .replace(/\s{2,}/g, " ")
     .trim();
@@ -887,98 +999,12 @@ function postProcess(text, stage, session) {
       .replace(/[^.!?]*\b\d+(?:\.\d+)?\s*(?:\"|inches?|mph|systems?|years?)\b[^.!?]*[.!?]?/gi, "")
       .replace(/\s{2,}/g, " ")
       .trim();
-    if (!result || !/\?/.test(result)) {
-      result = hasReason
-        ? "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?"
-        : "hail is a fair concern in Oklahoma. what got you looking at solar even with that worry?";
-    }
   }
 
-  // Category-choice questions lead the visitor. Use them only after repeated vague answers.
-  if (
-    stage === STAGES.DISCOVER &&
-    vagueCount < 2 &&
-    /(?:bill|backup|comparing options|compare options|lower the bill|cover outages|trying to lower|looking at backup|mostly the bill|either the bill|bill or backup)/i.test(result) &&
-    /\?/.test(result) &&
-    [INTENTS.EQUIPMENT, INTENTS.BATTERY, INTENTS.QUOTE_SHOPPER, INTENTS.SKEPTIC, INTENTS.COMMERCIAL, INTENTS.CURIOUS].includes(intent)
-  ) {
-    const answerPart = result
-      .split(/[?!]/)[0]
-      .replace(/[^.!]*\b(?:are you|is it|which one|what's mostly|what are you|more about|which one's|how'd|what'd)[^.!]*$/i, "")
-      .replace(/[^.!]*\b(?:bill|backup|outages|comparing options|lower the bill|cover outages)\b[^.!]*$/i, "")
-      .trim();
-    const question = getDiscoveryQuestion(intent, messages);
-    result = (answerPart ? answerPart.replace(/[.?!]*$/, ".") + " " : "") + question;
-  }
-
-  // If the user supplied utility but no real reason yet, avoid treating utility as motivation.
-  if (
-    stage === STAGES.DISCOVER &&
-    !hasReason &&
-    /(?:OGE|OG&E|PSO|electric company|utility)/i.test(allUserText) &&
-    /\b(?:bill|backup|comparing|lower|outages|own your home|name|call|homeowner|electric bill)\b/i.test(result)
-  ) {
-    result = "got it. what made you start checking into solar?";
-  }
-
-  const discoveryQuestion = getDiscoveryQuestion(intent, messages);
-  const escapedDiscovery = discoveryQuestion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const discoveryMatches = result.match(new RegExp(escapedDiscovery, "gi")) || [];
-  if (discoveryMatches.length > 1) {
-    result = result.replace(new RegExp("\\s*" + escapedDiscovery, "i"), "");
-  }
-  if (
-    stage === STAGES.DISCOVER &&
-    askedQuestions.some((q) => result.toLowerCase().includes(String(q).toLowerCase()))
-  ) {
-    const repeated = askedQuestions.find((q) => result.toLowerCase().includes(String(q).toLowerCase()));
-    const followUp = getFollowUpQuestion(intent, messages, repeated);
-    if (followUp) {
-      const beforeQuestion = result.split("?")[0].trim();
-      result = (beforeQuestion && !beforeQuestion.toLowerCase().includes(String(repeated).toLowerCase())
-        ? beforeQuestion.replace(/[.?!]*$/, ".") + " "
-        : "") + followUp;
-    }
-  }
-
-  if (
-    stage === STAGES.DISCOVER &&
-    hasReason &&
-    result.toLowerCase().includes(discoveryQuestion.toLowerCase())
-  ) {
-    if (intent === INTENTS.BATTERY) {
-      result = "that makes sense. how long were you without power the worst time?";
-    } else if (intent === INTENTS.EQUIPMENT && /\bhail\b/i.test(allUserText)) {
-      result = "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?";
-    } else if (intent === INTENTS.QUOTE_SHOPPER) {
-      result = "that helps. what part of the quote felt hardest to trust?";
-    }
-  }
-
-  if (
-    stage === STAGES.DISCOVER &&
-    /\bhail\b/i.test(allUserText) &&
-    /\b(?:what'?s your name|have Eric call|call you|call him|reach out)\b/i.test(result)
-  ) {
-    result = "hail is a fair concern in Oklahoma. what would you need to feel comfortable putting panels on the roof?";
-  }
-
-  // CONFIRM stage: no questions allowed
-  if (stage === STAGES.CONFIRM) {
-    // Replace trailing question with period
-    result = result.replace(/\?/g, ".");
-    // Clean up double periods
-    result = result.replace(/\.{2,}/g, ".");
-  }
-
-  // All other stages: enforce max one question mark
-  if (stage !== STAGES.CONFIRM) {
-    const qMarks = (result.match(/\?/g) || []).length;
-    if (qMarks > 1) {
-      // Keep everything up to and including the first question mark
-      const firstQ = result.indexOf("?");
-      result = result.substring(0, firstQ + 1);
-    }
+  // Keep at most one question.
+  const qMarks = (result.match(/\?/g) || []).length;
+  if (qMarks > 1) {
+    result = result.substring(0, result.indexOf("?") + 1);
   }
 
   // Enforce max 3 sentences
@@ -987,16 +1013,7 @@ function postProcess(text, stage, session) {
     result = sentences.slice(0, 3).join(" ");
   }
 
-  result = result.trim();
-  if (session && stage === STAGES.DISCOVER && /\?$/.test(result)) {
-    session.askedQuestions = Array.isArray(session.askedQuestions) ? session.askedQuestions : [];
-    if (!session.askedQuestions.includes(result)) {
-      session.askedQuestions.push(result);
-      if (session.askedQuestions.length > 5) session.askedQuestions.shift();
-    }
-  }
-
-  return result;
+  return result.trim();
 }
 
 // --- Lead extraction ---
@@ -1024,157 +1041,83 @@ function extractPhoneFromSession(session) {
 }
 
 function looksLikeName(text) {
-  if (/\d/.test(text)) return false;
-  if (text.split(/\s+/).length > 4) return false;
-  if (
-    /\b(i have|i got|i use|oge|og&e|pso|co-op|around|about|yes|no|yeah|nah|sure|ok)\b/i.test(
-      text
-    )
-  )
-    return false;
-  if (!/^[a-zA-Z\s.\-']+$/.test(text)) return false;
-  return true;
+  const value = String(text || "").trim();
+  if (!value || value.length >= 40 || /[?\d]/.test(value)) return false;
+  if (value.split(/\s+/).length > 3) return false;
+  if (!/^[a-zA-Z][a-zA-Z\s.\-']*$/.test(value)) return false;
+  return !/\b(?:solar|panel|panels|battery|backup|fridge|curious|interested|looking|ready|later|maybe|really|oge|og&e|pso|co-op|yes|no|yeah|nah|sure|okay|ok|cost|price|bill|home|house|business|off|grid|trying|want|wanting|in|from|at|after|before|tomorrow|today|morning|afternoon|evening|night|lunch|work|independent|without|lower|lowering|my|our|your|the|a|an|tulsa|norman|okc|edmond|moore|oklahoma)\b/i.test(value);
+}
+
+function formatName(text) {
+  return text
+    .split(/\s+/)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(" ");
 }
 
 function extractName(messages) {
-  // First pass: response right after Jennifer asks for name
-  for (let i = 1; i < messages.length; i++) {
-    const prev = messages[i - 1];
-    const curr = messages[i];
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const match = String(message.content || "")
+      .trim()
+      .match(/^(?:my name is|call me)\s+([^,.!?]+)[,.!?]?$/i);
+    const candidate = match?.[1]?.trim();
+    if (candidate && looksLikeName(candidate)) return formatName(candidate);
+  }
+
+  for (let index = messages.length - 1; index >= 1; index--) {
+    const previous = messages[index - 1];
+    const current = messages[index];
     if (
-      prev.role === "assistant" &&
-      curr.role === "user" &&
-      /(?:what's your name|your name\??$|who am i talking|what's your first name)/i.test(
-        prev.content
-      )
+      previous.role !== "assistant" ||
+      current.role !== "user" ||
+      !/(?:what's your (?:first )?name|your name\??$|who am i talking|name and number|share your name)/i.test(previous.content)
     ) {
-      const response = curr.content.trim();
-      const cleaned = response
-        .replace(
-          /^(?:my name is|i'm|it's|this is|i am|hey i'm|hey it's|call me)\s+/i,
-          ""
-        )
-        .replace(/[.!,]+$/, "")
-        .trim();
-      if (
-        cleaned.length > 0 &&
-        cleaned.length < 40 &&
-        looksLikeName(cleaned)
-      ) {
-        return cleaned
-          .split(/\s+/)
-          .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-          .join(" ");
-      }
+      continue;
     }
-  }
 
-  // Second pass: response after combined name+number ask
-  for (let i = 1; i < messages.length; i++) {
-    const prev = messages[i - 1];
-    const curr = messages[i];
-    if (
-      prev.role === "assistant" &&
-      curr.role === "user" &&
-      /(?:grab your (?:name|info)|get your (?:name|info)|name and number|can you share your name|what's your name)/i.test(
-        prev.content
-      )
-    ) {
-      const response = curr.content.trim();
-      const cleaned = response
-        .replace(
-          /^(?:my name is|i'm|it's|this is|i am|hey i'm|hey it's|call me)\s+/i,
-          ""
-        )
-        .replace(/[.!,]+$/, "")
-        .trim();
-      if (
-        cleaned.length > 0 &&
-        cleaned.length < 40 &&
-        looksLikeName(cleaned)
-      ) {
-        return cleaned
-          .split(/\s+/)
-          .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-          .join(" ");
-      }
-    }
-  }
-
-  // Third pass: Jennifer uses the name in her response
-  for (let i = 2; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role === "assistant") {
-      const nameMatch = msg.content.match(
-        /(?:perfect|great|awesome|thanks|nice|got it),?\s+([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?)\s*[!.]/i
-      );
-      if (nameMatch && looksLikeName(nameMatch[1])) {
-        return nameMatch[1];
-      }
-    }
-  }
-
-  // Fourth pass: user message that looks like just a name (short, no numbers, follows an ask)
-  for (let i = 1; i < messages.length; i++) {
-    const prev = messages[i - 1];
-    const curr = messages[i];
-    if (prev.role === "assistant" && curr.role === "user") {
-      const text = curr.content.trim();
-      const cleaned = text
-        .replace(
-          /^(?:my name is|i'm|it's|this is|i am|hey i'm|hey it's|call me)\s+/i,
-          ""
-        )
-        .replace(/[.!,]+$/, "")
-        .trim();
-      if (
-        cleaned.length > 1 &&
-        cleaned.length < 30 &&
-        cleaned.split(/\s+/).length <= 3 &&
-        looksLikeName(cleaned) &&
-        !extractPhone(text)
-      ) {
-        return cleaned
-          .split(/\s+/)
-          .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-          .join(" ");
-      }
-    }
+    const text = String(current.content || "").trim();
+    if (isConversationInterruption(text) || extractPhone(text)) continue;
+    const candidate = text
+      .replace(/^(?:my name is|i'm|i am|this is|call me)\s+/i, "")
+      .replace(/[.!,]+$/, "")
+      .trim();
+    if (looksLikeName(candidate)) return formatName(candidate);
   }
 
   return null;
 }
 
 function extractTime(messages) {
-  for (let i = 1; i < messages.length; i++) {
-    const curr = messages[i];
-    if (curr.role !== "user") continue;
-
-    const recentAssistantAsk = messages
-      .slice(Math.max(0, i - 4), i)
-      .some(
-        (msg) =>
-          msg.role === "assistant" &&
-          /morning|afternoon|evening|what time|time.*good|catch you|works better|usually better/i.test(
-            msg.content
-          )
-      );
-
-    if (recentAssistantAsk) {
-      const text = curr.content.trim().toLowerCase();
-      if (/\d{3}[\s.\-]\d{3,4}/.test(text)) continue; // looks like a phone number, skip
-      if (/morning/i.test(text)) return "mornings";
-      if (/afternoon/i.test(text)) return "afternoons";
-      if (/evening|night/i.test(text)) return "evenings";
-      if (/anytime|any time|whenever|doesn.t matter|don.t care/i.test(text)) return "anytime";
-      if (/\d{1,2}(?::\d{2})?\s*(?:am|pm)/i.test(text)) {
-        const match = text.match(/\d{1,2}(?::\d{2})?\s*(?:am|pm)/i);
-        return match ? match[0] : text.substring(0, 30);
-      }
-      if (text.length > 0 && text.length < 40) return text;
+  for (let index = messages.length - 1; index >= 1; index--) {
+    const previous = messages[index - 1];
+    const current = messages[index];
+    if (
+      previous.role !== "assistant" ||
+      current.role !== "user" ||
+      !isCallbackTimeQuestion(previous.content)
+    ) {
+      continue;
     }
+
+    const text = String(current.content || "").trim().toLowerCase();
+    if (!text || isConversationInterruption(text) || extractPhone(text)) continue;
+    if (/^(?:morning|mornings)$/.test(text)) return "mornings";
+    if (/^(?:afternoon|afternoons)$/.test(text)) return "afternoons";
+    if (/^(?:evening|evenings|night|nights)$/.test(text)) return "evenings";
+    if (/^(?:after lunch|before lunch|after work)$/.test(text)) return text;
+    if (/^(?:anytime|any time|whenever)$/.test(text)) return "anytime";
+    const clockTime = text.match(/^\d{1,2}(?::\d{2})?\s*(?:am|pm)$/i);
+    if (clockTime) return clockTime[0];
   }
   return null;
+}
+
+function isCallbackTimeQuestion(text) {
+  const value = String(text || "");
+  if (!value.includes("?")) return false;
+  return /\bwhat time(?: of day|['’]s| is)?\b|\bwhen\b[^?]{0,50}\b(?:call|reach|catch)\b|\bmornings?\s+or\s+afternoons?\b|\b(?:morning|afternoon|evening)s?\b[^?]{0,30}\b(?:better|best|work)\b/i.test(value);
 }
 
 function extractContext(messages) {
@@ -1482,6 +1425,7 @@ function summarizeConversation(messages, callback) {
 // --- Lead capture ---
 
 function checkAndSendLead(session, sessionId) {
+  if (session.callbackAccepted === false) return;
   const existingLead = leadsBySession.get(sessionId);
   if (existingLead && existingLead.status === "completed") {
     session.leadSent = true;
@@ -1523,9 +1467,12 @@ function checkAndSendLead(session, sessionId) {
   };
   storeLeadRecord(leadRecord);
 
-  console.log("=== LEAD CAPTURED ===");
-  console.log(JSON.stringify(leadRecord, null, 2));
-  console.log("=====================");
+  console.log(JSON.stringify({
+    event: "jennifer_lead_captured",
+    sessionId,
+    status: leadStatus,
+    score: leadScore.label,
+  }));
 
   // Build details + summary for Eric — send immediately so he's ready
   const details = [
@@ -1580,7 +1527,8 @@ function checkAndSendLead(session, sessionId) {
 
   // Text the lead as Eric after a delay — feels human, not instant bot
   if (leadStatus === "completed") {
-    setTimeout(() => {
+    session.leadTextTimer = setTimeout(() => {
+      session.leadTextTimer = null;
       sendIMessage(
         leadPhone,
         "hey " + leadName + ", this is Eric with Affordable Solar. jennifer mentioned you had some questions about going solar. do you have a few minutes to chat?"
@@ -1589,12 +1537,77 @@ function checkAndSendLead(session, sessionId) {
   }
 }
 
+function withdrawLead(sessionId) {
+  const existingLead = leadsBySession.get(sessionId);
+  if (!existingLead || existingLead.status === "withdrawn") return false;
+
+  storeLeadRecord({
+    ...existingLead,
+    status: "withdrawn",
+    withdrawnAt: new Date().toISOString(),
+  });
+  sendPushoverAlert(
+    "Jennifer callback withdrawn",
+    "Do not call. Callback consent was withdrawn.\nSession: " + sessionId,
+    { priority: 1, sound: "pushover", url: historyUiUrl(), urlTitle: "Open chat history" }
+  );
+  sendTelegramAlert(
+    "<b>Callback withdrawn</b>\nDo not call.\n<b>Session:</b> " + sessionId
+  );
+  console.log(JSON.stringify({
+    event: "jennifer_lead_withdrawn",
+    sessionId,
+  }));
+  return true;
+}
+
+async function requestOpenRouter(messages) {
+  const startedAt = Date.now();
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + OPENROUTER_API_KEY,
+      "HTTP-Referer": "https://affordablesolar.io",
+      "X-Title": "Jennifer Sales Chat",
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      messages,
+      temperature: 0.7,
+      max_tokens: 200,
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const result = await response.json();
+  const content = result.choices?.[0]?.message?.content;
+  if (!content) {
+    console.error(JSON.stringify({
+      event: "openrouter_bad_response",
+      status: response.status,
+      model: OPENROUTER_MODEL,
+    }));
+  }
+  return {
+    content: content || "Sorry, can you try asking again?",
+    modelMs: Date.now() - startedAt,
+  };
+}
+
+function logDecision(fields) {
+  console.log(JSON.stringify({
+    event: "jennifer_decision",
+    ...fields,
+    processUptimeMs: Math.round(process.uptime() * 1000),
+  }));
+}
+
 // --- HTTP server ---
 
 const server = http.createServer((req, res) => {
-  console.log(new Date().toISOString(), req.method, req.url);
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const pathname = requestUrl.pathname;
+  console.log(new Date().toISOString(), req.method, pathname);
 
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -1716,11 +1729,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "POST") {
+    const requestStartedAt = Date.now();
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
-      console.log("Request body:", body.substring(0, 200));
-
       try {
         const input = JSON.parse(body);
         const userMessage = input.message || "";
@@ -1729,6 +1741,16 @@ const server = http.createServer((req, res) => {
           `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
         if (!userMessage) {
+          logDecision({
+            sessionId,
+            intent: INTENTS.CURIOUS,
+            stage: STAGES.OPEN,
+            cleanupChanged: false,
+            repeatDetected: false,
+            retryCount: 0,
+            modelMs: 0,
+            totalMs: Date.now() - requestStartedAt,
+          });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -1757,14 +1779,45 @@ const server = http.createServer((req, res) => {
           storeHistoryMessage(sessionId, "user", userMessage);
         }
 
+        if (isIdentityQuestion(userMessage)) {
+          const response = getIdentityResponse();
+          if (session) {
+            session.messages.push({ role: "assistant", content: response });
+            storeHistoryMessage(sessionId, "assistant", response);
+          }
+          logDecision({
+            sessionId,
+            intent: INTENTS.CURIOUS,
+            stage: STAGES.DISCOVER,
+            cleanupChanged: false,
+            repeatDetected: false,
+            retryCount: 0,
+            modelMs: 0,
+            totalMs: Date.now() - requestStartedAt,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ response, sessionId }));
+          return;
+        }
+
         // Quick intercept: if they want to call, give the number immediately
-        if (/\b(can i call|just call|rather call|want to call|phone number|talk to someone|speak to someone|talk to a person|real person)\b/i.test(userMessage)) {
-          const response = "for sure, give us a call at (405) 400-2836 anytime. if you want Eric to call you instead, what's your name?";
+        if (isDirectCallRequest(userMessage)) {
+          const response = getDirectCallResponse();
           if (session) {
             session.messages.push({ role: "assistant", content: response });
             storeHistoryMessage(sessionId, "assistant", response);
             checkAndSendLead(session, sessionId);
           }
+          logDecision({
+            sessionId,
+            intent: INTENTS.DIRECT_CALL,
+            stage: session?.stage || STAGES.OPEN,
+            cleanupChanged: false,
+            repeatDetected: false,
+            retryCount: 0,
+            modelMs: 0,
+            totalMs: Date.now() - requestStartedAt,
+          });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -1776,46 +1829,16 @@ const server = http.createServer((req, res) => {
         }
 
         // Determine stage AFTER adding the user message
-        const stage = session ? getStage(session) : STAGES.OPEN;
-        const stageInstruction = STAGE_INSTRUCTIONS[stage];
-
-        // Stage can only go forward
-        if (stage > (session.stage || STAGES.OPEN)) {
-          session.stage = stage;
-        }
-        const activeStage = session.stage || stage;
-
-        console.log(
-          "Session " +
-            (sessionId || "none") +
-            ": stage=" +
-            activeStage +
-            " messages=" +
-            (session ? session.messages.length : 0)
-        );
-
-        // Build context summary so Jennifer doesn't re-ask what she already knows
-        const knownContext = extractContext(session ? session.messages : []);
+        const activeStage = getActiveStage(session);
+        if (isCallbackWithdrawal(userMessage)) withdrawLead(sessionId);
         const knownIntent = detectIntent(session ? session.messages : []);
-        const knownScore = scoreLead(session ? session.messages : [], knownContext, session ? session.leadData : {});
-        const knownReason = extractReasonRaw(session ? session.messages : []);
         const knownParts = [];
-        knownParts.push("intent: " + knownIntent);
-        knownParts.push("lead heat: " + knownScore.label);
-        knownParts.push("next discovery question: " + getDiscoveryQuestion(knownIntent, session ? session.messages : []));
-        if (session && session.askedQuestions && session.askedQuestions.length) {
-          knownParts.push("questions already asked: " + session.askedQuestions.join(" | "));
-        }
-        if (knownReason) knownParts.push("visitor reason in their words: " + knownReason);
-        if (knownContext.utility) knownParts.push("utility: " + knownContext.utility);
-        if (knownContext.bill) knownParts.push("bill: " + knownContext.bill);
-        if (knownContext.motivation) knownParts.push("motivation: " + knownContext.motivation);
-        if (knownContext.propertyType) knownParts.push("property: " + knownContext.propertyType);
-        if (knownContext.homeowner) knownParts.push("homeowner: " + knownContext.homeowner);
-        if (knownContext.city) knownParts.push("city: " + knownContext.city);
-        if (knownContext.urgency) knownParts.push("urgency: " + knownContext.urgency);
+        if (session?.callbackAccepted) knownParts.push("callback accepted");
+        if (session?.leadData.name) knownParts.push("name: " + session.leadData.name);
+        if (session?.leadData.phone) knownParts.push("phone number captured");
+        if (session?.leadData.time) knownParts.push("preferred time: " + session.leadData.time);
         const contextNote = knownParts.length > 0
-          ? "\n\nWHAT YOU KNOW SO FAR: " + knownParts.join(", ") + ". Do NOT ask about these again."
+          ? "\n\nCONFIRMED CALLBACK DETAILS: " + knownParts.join(", ") + ". Do not ask for captured fields again."
           : "";
 
         // Build messages with stage instruction and known context appended
@@ -1834,47 +1857,95 @@ const server = http.createServer((req, res) => {
 
         (async () => {
           try {
-            const chatResp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + OPENROUTER_API_KEY,
-                "HTTP-Referer": "https://affordablesolar.io",
-                "X-Title": "Jennifer Sales Chat",
-              },
-              body: JSON.stringify({
-                model: OPENROUTER_MODEL,
-                messages: messages,
-                temperature: 0.7,
-                max_tokens: 200,
-              }),
-              signal: AbortSignal.timeout(30000),
-            });
+            let retryCount = 0;
+            let modelMs = 0;
+            let repeatDetected = false;
+            let retryStillRepeated = false;
 
-            const result = await chatResp.json();
-
-            if (!result.choices?.[0]?.message?.content) {
-              console.error("OpenRouter bad response:", JSON.stringify(result).substring(0, 300));
+            const firstAttempt = await requestOpenRouter(messages);
+            modelMs += firstAttempt.modelMs;
+            let response = postProcess(firstAttempt.content, activeStage, session);
+            let cleanupChanged = response !== firstAttempt.content;
+            const firstRepeated = isRepeatedReply(response, session ? session.messages : []);
+            if (firstRepeated) {
+              repeatDetected = true;
+              const withoutRepeatedQuestion = removeRepeatedQuestions(
+                response,
+                session ? session.messages : []
+              );
+              if (withoutRepeatedQuestion !== response) {
+                response = withoutRepeatedQuestion;
+                cleanupChanged = true;
+              }
             }
 
-            let response =
-              result.choices?.[0]?.message?.content ||
-              "Sorry, can you try asking again?";
-
-            response = postProcess(response, activeStage, session);
-
-            console.log("OpenRouter response (stage " + activeStage + "):", response.substring(0, 100));
+            if (needsModelRetry(response, session ? session.messages : [])) {
+              repeatDetected = repeatDetected || isRepeatedReply(
+                response,
+                session ? session.messages : []
+              );
+              retryCount = 1;
+              const retryMessages = messages.map((message, index) => index === 0
+                ? {
+                    ...message,
+                    content: message.content +
+                      "\n\nRETRY: The previous draft was empty after safety cleanup or repeated an earlier response or question. Answer the visitor's latest message directly, stay within the safety rules, and do not repeat any prior question.",
+                  }
+                : message);
+              const retryAttempt = await requestOpenRouter(retryMessages);
+              modelMs += retryAttempt.modelMs;
+              let retryResponse = postProcess(retryAttempt.content, activeStage, session);
+              const withoutRepeatedQuestion = removeRepeatedQuestions(
+                retryResponse,
+                session ? session.messages : []
+              );
+              cleanupChanged = cleanupChanged ||
+                retryResponse !== retryAttempt.content ||
+                withoutRepeatedQuestion !== retryResponse;
+              retryResponse = withoutRepeatedQuestion;
+              retryStillRepeated = needsModelRetry(retryResponse, session ? session.messages : []);
+              response = retryStillRepeated
+                ? getNonRepeatedRecovery(session ? session.messages : [])
+                : retryResponse;
+            }
 
             if (session) {
               session.messages.push({ role: "assistant", content: response });
               storeHistoryMessage(sessionId, "assistant", response);
+              if (activeStage === STAGES.CONFIRM) {
+                session.callbackConfirmed = true;
+                session.stage = STAGES.DISCOVER;
+              }
               checkAndSendLead(session, sessionId);
             }
+
+            logDecision({
+              sessionId,
+              intent: knownIntent,
+              stage: activeStage,
+              cleanupChanged,
+              repeatDetected,
+              retryStillRepeated,
+              retryCount,
+              modelMs,
+              totalMs: Date.now() - requestStartedAt,
+            });
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ response, sessionId }));
           } catch (e) {
             console.error("OpenRouter fetch error:", e.message);
+            logDecision({
+              sessionId,
+              intent: knownIntent,
+              stage: activeStage,
+              cleanupChanged: false,
+              repeatDetected: false,
+              retryCount: 0,
+              modelMs: null,
+              totalMs: Date.now() - requestStartedAt,
+              error: true,
+            });
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ response: "Sorry, something went wrong. Call us at (405) 400-2836." }));
           }
@@ -1890,12 +1961,41 @@ const server = http.createServer((req, res) => {
   }
 });
 
-loadHistoryFromDisk();
-loadLeadsFromDisk();
+function startServer() {
+  loadHistoryFromDisk();
+  loadLeadsFromDisk();
+  startSessionCleanup();
 
-server.listen(PORT, () => {
-  console.log("Solar chat proxy listening on port " + PORT);
-  console.log("Session TTL: " + SESSION_TTL / 1000 + "s");
-  console.log("Lead notifications: iMessage to " + ERIC_PHONE);
-  console.log("Stages: OPEN → DISCOVER → COLLECT_NAME → COLLECT_PHONE → CONFIRM");
-});
+  return server.listen(PORT, () => {
+    console.log("Solar chat proxy listening on port " + PORT);
+    console.log("Session TTL: " + SESSION_TTL / 1000 + "s");
+    console.log("Lead notifications: iMessage to " + ERIC_PHONE);
+    console.log("Stages: OPEN → DISCOVER → COLLECT_NAME → COLLECT_PHONE → CONFIRM");
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  STAGES,
+  INTENTS,
+  detectIntent,
+  extractContext,
+  extractReasonRaw,
+  extractName,
+  extractTime,
+  getActiveStage,
+  getStage,
+  getDirectCallResponse,
+  getIdentityResponse,
+  getNonRepeatedRecovery,
+  isDirectCallRequest,
+  isIdentityQuestion,
+  isRepeatedReply,
+  needsModelRetry,
+  postProcess,
+  removeRepeatedQuestions,
+  startServer,
+};

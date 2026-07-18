@@ -5,13 +5,12 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 
 ## Why first
 - Smallest change surface
-- Removes primary failure point behind Cloudflare tunnel (jennifer.affordablesolar.io)
+- Removes the chat webhook's dependency on the old local tunnel
 - Keeps Typebot builder/viewer on current host until verified
 
 ## Current production endpoint strategy (adopted)
-- Primary hostname for the chat API is the Render URL: `https://jennifer-proxy.onrender.com`
-- `jennifer.affordablesolar.io` may remain as a branded frontend alias when explicitly routed, but is **not required for function**.
-- Keep branded DNS/tunnel mapping only if you want the vanity domain in public usage; the service is fully usable without it.
+- The only required chat API hostname is `https://jennifer-proxy.onrender.com`.
+- Typebot sends chat turns to `https://jennifer-proxy.onrender.com/chat`.
 
 ## Render deployment contract
 - Service: `jennifer-proxy`
@@ -47,11 +46,19 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - `GET /leads?token=...` returns captured partial and completed leads.
 - `POST /history/import` imports old Typebot history; protect with the history token.
 
+## Live Typebot flow invariants
+1. The welcome text is exactly: `Hi, I'm Jennifer, Affordable Solar's AI assistant. What are you trying to figure out about solar?`
+2. The flow creates one session ID per chat and reuses it for every turn in that chat.
+3. Each visitor message is sent as JSON to `https://jennifer-proxy.onrender.com/chat` with the message and session ID.
+4. The flow maps `data.response` to `llm_response`, displays it, and returns to one free-text input. It has no direct LLM block, category buttons, or separate lead-capture branch.
+5. `settings.general.isInputPrefillEnabled` is `false` in both the matching `PublicTypebot` and `Typebot` rows.
+
 ## Chat and lead behavior
-- The Typebot website flow should call `https://jennifer-proxy.onrender.com/chat`.
-- Jennifer answers first, then discovers the visitor's reason before qualification.
-- Equipment, quote, battery, hail, and vague-intent flows use topic-specific discovery.
-- The proxy tracks repeated discovery questions per in-memory session and avoids repeating exact questions when possible.
+- Jennifer identifies as Affordable Solar's AI assistant and never implies she is human.
+- The latest visitor message controls the topic. Jennifer answers explicit questions before discovery or callback collection.
+- When Jennifer misunderstands a visitor, she briefly acknowledges the error and answers the corrected topic.
+- Callback collection starts only after visitor agreement and remains interruptible by questions, corrections, or withdrawal.
+- Capturing callback details does not end the conversation.
 - A lead can be `partial` once a phone number is captured.
 - A lead becomes `completed` when name, phone, and preferred call time are captured.
 - Lead records are stored in `chat-leads.jsonl` and exposed through `/leads`.
@@ -73,6 +80,7 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 
 ## Notes before deploy
 - `jennifer-proxy.js` uses container-safe, repo-relative prompt resolution for `/chat` startup.
+- Claims under `APPROVED KNOWLEDGE` in `jennifer-system-prompt.txt` are business-owned claims and must be reverified when products, certifications, warranties, financing, service coverage, or utility facts change.
 - iMessage send path is guarded behind `ENABLE_IMESSAGE=true` and falls back on Linux hosts.
 - Ollama summary is guarded behind `OLLAMA_HOST` + timeout; default keep disabled unless explicitly enabled.
 - Pushover and Telegram are optional. Missing notification credentials must not break chat handling.
@@ -81,18 +89,32 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
   - `/Users/infinitewatts/.config/pushover/.user_key` -> `PUSHOVER_USER_KEY`
   - `/Users/infinitewatts/.config/pushover/.device` -> `PUSHOVER_DEVICE`
 
-## Migration steps
-1. Keep render runtime files under `/typebot` (`render.yaml`, `start-render.sh`, `package.json`, code updates).
-2. Verify deploy reaches `live` state in Render CLI with commit from `typebot-jennifer-proxy-render`.
-3. Smoke tests:
-   - `GET /` -> `{"status":"Solar chat proxy running"}`
-   - `POST /chat` -> valid JSON response
-   - Better Stack uptime checks should target `GET /` only, not `/history-ui`, `/history`, or local `:3090`.
-   - Render logs include `Pushover alert sent, status: 1` after a new-chat test when Pushover is configured.
-4. Verify production hostname target path:
-   - `https://jennifer-proxy.onrender.com` (required)
-   - `https://jennifer.affordablesolar.io` (optional only if you want branded access)
-5. After this baseline is stable, proceed with Typebot viewer/builder migration next.
+## Verification command
+Run the deterministic conversation regressions before every deploy:
+
+```sh
+node --test jennifer-test-harness.js
+```
+
+## Backup gate
+1. Export the matching `PublicTypebot` row and `Typebot` row before any live flow change.
+2. Store the backup outside the database and record its SHA-256 hash.
+3. Verify the backup contains groups, edges, variables, settings, and the five live-flow invariants above.
+4. Do not mutate the live flow unless the backup parses and its hash has been recorded.
+
+## Deploy gate
+1. Run `node --test jennifer-test-harness.js` and `node --check jennifer-proxy.js` from the deployment commit.
+2. Update and verify the AI-disclosing Typebot welcome before deploying a prompt that assumes the disclosure is present.
+3. Verify Render reaches `live` with the intended commit from `typebot-jennifer-proxy-render`.
+4. Verify `GET /` returns `{"status":"Solar chat proxy running"}` and `POST /chat` returns valid JSON.
+5. Run the answer-first, identity, topic-repair, interrupted-handoff, and no-repeat production smoke cases.
+6. Confirm the five live-flow invariants again after the smoke run.
+
+## Rollback gate
+1. If a deploy or smoke gate fails, redeploy the last verified Render commit.
+2. If the Typebot flow changed, restore both rows together from the matching verified backup.
+3. Recheck the health endpoint, one chat turn, and all five live-flow invariants.
+4. Do not use historical full-flow SQL files as rollback sources.
 
 ## Current production notes
 - The Render URL is the active production chat proxy.
