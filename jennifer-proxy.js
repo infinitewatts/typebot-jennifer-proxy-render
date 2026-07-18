@@ -112,7 +112,7 @@ function isDirectCallRequest(text) {
   const value = String(text || "");
   if (isIdentityQuestion(value)) return false;
   if (/\b(?:do not|don't|dont|never|no longer)\b[^.!?]{0,60}\b(?:call|phone number|talk|speak|contact|real person|human)\b/i.test(value)) return false;
-  return /\b(?:can i call|just call|rather call|want to call|phone number|(?:can i |let me |want to |rather )?(?:talk|speak) to (?:someone|a person|a real person|a human)|real person please)\b/i.test(value);
+  return /\b(?:can i call|just call|rather call|want to call|call (?:you|the office)|(?:what(?:'s| is)|give me|send me) (?:your|the office) (?:phone )?number|what number (?:can|should) i call|(?:can i |let me |want to |rather )?(?:talk|speak) to (?:someone|a person|a real person|a human)|real person please)\b/i.test(value);
 }
 
 function getDirectCallResponse() {
@@ -692,16 +692,77 @@ function isConversationInterruption(text) {
     /\b(?:not sure|hold on|one sec|give me a minute|let me think|not ready|maybe later|another question|no thanks|not interested)\b/i.test(value);
 }
 
+const CALLBACK_OFFER_PATTERNS = [
+  /\bwould you like to (?:speak|talk) (?:to|with) (?:Eric|an? advisor|someone)\b/i,
+  /\bwould you like\b[^.!?]{0,60}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,40}\b(?:call|contact|reach out)\b/i,
+  /\b(?:i|we) can have\b[^.!?]{0,30}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:call|contact|reach out)\b/i,
+  /\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:can|could|will|would)\b[^.!?]{0,20}\b(?:call|contact|reach out)\b/i,
+  /\b(?:would you )?(?:want|like) (?:a )?callback\b/i,
+  /\b(?:i|we) can arrange (?:a )?(?:call|callback)\b/i,
+  /\b(?:(?:i|we)(?:'d| would) be happy to )?arrange (?:a )?(?:call|callback)\b/i,
+];
+
+const CONTACT_COLLECTION_PATTERNS = [
+  /\bwhat(?:'s| is) your (?:full )?name\b/i,
+  /\b(?:can|could|may) i (?:get|have) your (?:phone |cell |mobile )?number\b/i,
+  /\bwhat(?:'s| is) (?:the )?best (?:phone |cell |mobile )?number to (?:call|reach|contact) you\b/i,
+  /\bwhat(?:'s| is) your (?:phone|cell|mobile) number\b/i,
+  /\bwhat time\b[^.!?]{0,40}\b(?:Eric|call|reach|contact)\b/i,
+  /\byou can (?:call|reach|contact) (?:us|Eric) at\b/i,
+  /\b(?:our|the office) (?:phone )?number is\b/i,
+  /\(405\)\s*400[- ]2836\b/i,
+];
+
+function firstPatternIndex(text, patterns) {
+  let first = -1;
+  for (const pattern of patterns) {
+    const index = String(text || "").search(pattern);
+    if (index >= 0 && (first < 0 || index < first)) first = index;
+  }
+  return first;
+}
+
 function assistantOfferedCallback(text) {
-  const value = String(text || "");
-  return /\bwould you like to (?:speak|talk) (?:to|with) (?:Eric|an? advisor|someone)\b|\bwould you like\b[^.!?]{0,60}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,40}\b(?:call|contact|reach out)\b|\b(?:i|we) can have\b[^.!?]{0,30}\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:call|contact|reach out)\b|\b(?:Eric|an? advisor|someone)\b[^.!?]{0,30}\b(?:can|could|will|would)\b[^.!?]{0,20}\b(?:call|contact|reach out)\b|\b(?:want|like) (?:a )?callback\b|\barrange (?:a )?(?:call|callback)\b/i.test(value);
+  return firstPatternIndex(text, CALLBACK_OFFER_PATTERNS) >= 0;
+}
+
+function removeUnrequestedCallbackOffer(text, session) {
+  const latestUserText = getLatestUserMessage(session?.messages || [])?.content || "";
+  if (
+    session?.callbackAccepted ||
+    isIdentityQuestion(latestUserText) ||
+    isDirectCallRequest(latestUserText) ||
+    explicitlyAcceptsCallback(latestUserText)
+  ) {
+    return String(text || "").trim();
+  }
+
+  const segments = String(text || "").match(/[^.!?]+[.!?]?/g) || [];
+  return segments
+    .map((segment) => {
+      const callbackIndex = firstPatternIndex(segment, CALLBACK_OFFER_PATTERNS);
+      const collectionIndex = firstPatternIndex(segment, CONTACT_COLLECTION_PATTERNS);
+      const indexes = [callbackIndex, collectionIndex].filter((index) => index >= 0);
+      if (indexes.length === 0) return segment.trim();
+
+      const prefix = segment
+        .slice(0, Math.min(...indexes))
+        .replace(/[\s,;:]+$/, "")
+        .trim();
+      if (!prefix) return "";
+      return /[.!?]$/.test(prefix) ? prefix : prefix + ".";
+    })
+    .filter(Boolean)
+    .join(" ")
+    .trim();
 }
 
 function explicitlyAcceptsCallback(text) {
   const value = String(text || "");
+  if (isDirectCallRequest(value)) return false;
   const callMeName = value.match(/^call me\s+([^,.!?]+)[,.!?]?$/i);
   if (callMeName && !extractPhone(value) && looksLikeName(callMeName[1])) return false;
-  return /\b(?:call me|give me a call|have (?:Eric|him|someone) call|you can call|please call|i(?:'d| would) like (?:a )?call|reach out to me|contact me)\b/i.test(value);
+  return /\b(?:call me|give me a call|have (?:Eric|him|someone) call me|you can call me|please call me|i(?:'d| would) like (?:a )?call|reach out to me|contact me)\b/i.test(value);
 }
 
 function inferCallbackAcceptance(messages) {
@@ -982,6 +1043,9 @@ function postProcess(text, _stage, session) {
 
   // The site can offer an office call or callback, not a live transfer.
   result = result.replace(/[^.!?]*\b(?:connect you (?:now|live|directly)|transfer you|put you through)\b[^.!?]*[.!?]?/gi, "").trim();
+
+  // A callback is a consented handoff, not a default discovery question.
+  result = removeUnrequestedCallbackOffer(result, session);
 
   // Strip ITC/tax credit mentions
   result = result.replace(/[^.!?]*\b(?:ITC|tax credit|federal incentive|federal tax|investment tax)\b[^.!?]*[.!?]?/gi, "").trim();
@@ -1840,12 +1904,15 @@ const server = http.createServer((req, res) => {
         const contextNote = knownParts.length > 0
           ? "\n\nCONFIRMED CALLBACK DETAILS: " + knownParts.join(", ") + ". Do not ask for captured fields again."
           : "";
+        const handoffNote = session?.callbackAccepted
+          ? ""
+          : "\n\nHANDOFF STATUS: The visitor has not requested or accepted human contact. Do not mention Eric, a callback, the office, a phone number, or contact collection. Continue helping with the latest topic.";
 
         // Build messages with stage instruction and known context appended
         const messages = [
           {
             role: "system",
-            content: systemPrompt + "\n\n" + STAGE_INSTRUCTIONS[activeStage] + contextNote,
+            content: systemPrompt + "\n\n" + STAGE_INSTRUCTIONS[activeStage] + contextNote + handoffNote,
           },
         ];
 

@@ -147,6 +147,79 @@ test("July 18 second reply does not restore the exact prior outage sentence", ()
   assert.notEqual(result, forcedOutageReply);
 });
 
+test("July 18 follow-up does not pivot to an unrequested callback", () => {
+  const currentSession = session(
+    [
+      user(july18Question),
+      assistant(
+        "The cost depends on usage, roof, equipment, and backup needs."
+      ),
+      user(july18Reason),
+    ],
+    STAGES.DISCOVER
+  );
+
+  for (const draft of [
+    "Energy independence is a valid reason to consider off-grid solar. Would you like a callback from Eric to discuss options?",
+    "Energy independence is a valid reason to consider off-grid solar, would you like a callback from Eric to discuss options?",
+    "Energy independence is a valid reason to consider off-grid solar; would you like to talk with Eric?",
+    "Energy independence is a valid reason to consider off-grid solar.Would you like a callback from Eric?",
+  ]) {
+    assert.equal(
+      postProcess(draft, STAGES.DISCOVER, currentSession),
+      "Energy independence is a valid reason to consider off-grid solar.",
+      draft
+    );
+  }
+});
+
+test("an accepted callback remains available after handoff consent", () => {
+  const currentSession = session(
+    [user("Please have Eric call me about an off-grid system")],
+    STAGES.DISCOVER
+  );
+  assert.equal(getActiveStage(currentSession), STAGES.COLLECT_NAME);
+  assert.equal(currentSession.callbackAccepted, true);
+
+  const response = "I can arrange that callback. What is your name?";
+  assert.equal(
+    postProcess(response, STAGES.COLLECT_NAME, currentSession),
+    response
+  );
+});
+
+test("asking to call the office does not consent to a callback", () => {
+  const currentSession = session(
+    [user("Please call the office")],
+    STAGES.DISCOVER
+  );
+
+  assert.equal(isDirectCallRequest("Please call the office"), true);
+  assert.equal(getActiveStage(currentSession), STAGES.DISCOVER);
+  assert.equal(currentSession.callbackAccepted, false);
+});
+
+test("unrequested contact collection is removed without deleting the answer", () => {
+  const currentSession = session(
+    [user(july18Reason)],
+    STAGES.DISCOVER
+  );
+  const answer = "Off-grid solar uses battery storage to run without grid power.";
+
+  for (const draft of [
+    answer + " What's your name?",
+    answer + " What's the best number to reach you?",
+    answer + " What time is best for Eric to call?",
+    answer + " You can reach Eric at (405) 400-2836.",
+  ]) {
+    assert.equal(
+      postProcess(draft, STAGES.DISCOVER, currentSession),
+      answer,
+      draft
+    );
+  }
+});
+
 test("detach/reset transcript does not turn Solar panels into a customer name", () => {
   const messages = [
     user("detach-and-reset tulsa ok 23 panels before roof replacement"),
@@ -594,13 +667,17 @@ test("post-processing retains safety-only cleanup", () => {
     "Do you know your monthly electricity usage in kWh?"
   );
 
+  const directCallSession = session(
+    [user("Can I call the office?")],
+    STAGES.DISCOVER
+  );
   assert.equal(
     postProcess(
-      "You can reach Eric at (405) 400-2836. Would you like me to connect you now?",
+      "You can reach us at (405) 400-2836. Would you like me to connect you now?",
       STAGES.DISCOVER,
-      currentSession
+      directCallSession
     ),
-    "You can reach Eric at (405) 400-2836."
+    "You can reach us at (405) 400-2836."
   );
 });
 
