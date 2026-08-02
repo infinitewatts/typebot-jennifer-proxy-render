@@ -1216,6 +1216,7 @@ function extractTime(messages) {
     if (/^(?:morning|mornings)$/.test(text)) return "mornings";
     if (/^(?:afternoon|afternoons)$/.test(text)) return "afternoons";
     if (/^(?:evening|evenings|night|nights)$/.test(text)) return "evenings";
+    if (/^(?:today|tomorrow) (?:morning|afternoon|evening)$/.test(text)) return text;
     if (/^(?:after lunch|before lunch|after work)$/.test(text)) return text;
     if (/^(?:anytime|any time|whenever)$/.test(text)) return "anytime";
     const clockTime = text.match(/^\d{1,2}(?::\d{2})?\s*(?:am|pm)$/i);

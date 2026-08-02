@@ -409,6 +409,14 @@ test("a recognized time is still captured after an explicit time question", () =
     ]),
     "3 pm"
   );
+
+  assert.equal(
+    extractTime([
+      assistant("what time of day is best to reach you?"),
+      user("Tomorrow afternoon"),
+    ]),
+    "tomorrow afternoon"
+  );
 });
 
 test("time extraction requires the immediately preceding assistant turn to ask for time", () => {
