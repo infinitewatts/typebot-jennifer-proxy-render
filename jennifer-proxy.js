@@ -1,9 +1,8 @@
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
-const { execFile } = require("child_process");
+const { createHash, createHmac } = require("crypto");
 const path = require("path");
-const os = require("os");
 
 const _PORT = parseInt((process.env.PORT || "3090").trim(), 10);
 const PORT = Number.isInteger(_PORT) && _PORT > 0 ? _PORT : 3090;
@@ -12,8 +11,6 @@ const CLEANUP_INTERVAL = 5 * 60 * 1000;
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || "http://localhost:11434").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
 const OPENROUTER_MODEL = "mistralai/mistral-small-3.2-24b-instruct";
-const ERIC_PHONE = "+14058182636";
-const LEAD_TEXT_DELAY = Number(process.env.LEAD_TEXT_DELAY_MS || "240000");
 const NTFY_URL = "https://ntfy.sh/AffordableSolarLeads";
 const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_CHAT_ID = "-1003773483505";
@@ -24,7 +21,8 @@ const PUSHOVER_DEVICE = (process.env.PUSHOVER_DEVICE || "").trim();
 const PUBLIC_BASE_URL = (process.env.JENNIFER_PUBLIC_BASE_URL || "https://jennifer-proxy.onrender.com").trim().replace(/\/+$/, "");
 const LEAD_SUMMARY_ENABLED = !/^(0|false|off|no)$/i.test((process.env.LEAD_SUMMARY_ENABLED || "true").trim());
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || "qwen3:8b").trim();
-const ENABLE_IMESSAGE = /^\s*(1|true|yes|on)\s*$/i.test((process.env.ENABLE_IMESSAGE || "false").trim());
+const MESSAGE_INTENT_URL = (process.env.JENNIFER_MESSAGE_INTENT_URL || "").trim();
+const MESSAGE_INTENT_SECRET = (process.env.JENNIFER_MESSAGE_INTENT_SECRET || "").trim();
 const CHAT_HISTORY_FILE = path.resolve(
   process.env.JENNIFER_CHAT_HISTORY_FILE ||
     path.join(__dirname, "chat-history.jsonl")
@@ -78,7 +76,8 @@ const STAGES = {
   COLLECT_NAME: 3,
   COLLECT_PHONE: 4,
   COLLECT_TIME: 5,
-  CONFIRM: 6,
+  COLLECT_SMS_CONSENT: 6,
+  CONFIRM: 7,
 };
 
 const STAGE_INSTRUCTIONS = {
@@ -92,8 +91,10 @@ const STAGE_INSTRUCTIONS = {
     "CALLBACK STATE: The visitor accepted a callback and their phone number is missing. Answer their latest message first. If they did not interrupt the callback, ask for the best number to reach them in one short sentence.",
   [STAGES.COLLECT_TIME]:
     "CALLBACK STATE: The visitor accepted a callback and their preferred time is missing. Answer their latest message first. If they did not interrupt the callback, ask what time of day is best in one short sentence.",
+  [STAGES.COLLECT_SMS_CONSENT]:
+    "CALLBACK STATE: Name, phone, and preferred time are captured, but text permission is unanswered. Ask exactly: May Eric text this number about your solar questions? You can say no.",
   [STAGES.CONFIRM]:
-    "CALLBACK STATE: Name, phone, and preferred time are confirmed. Answer the latest message first, then briefly confirm that Eric will reach out. The conversation remains open for questions.",
+    "CALLBACK STATE: Name, phone, preferred time, and the visitor's text-permission choice are confirmed. Answer the latest message first, then briefly confirm that Eric will reach out. Do not claim he will text if permission was declined. The conversation remains open for questions.",
 };
 
 function isGenericGreeting(text) {
@@ -809,6 +810,39 @@ function inferCallbackAcceptance(messages) {
   return accepted;
 }
 
+function assistantAskedSmsConsent(text) {
+  return /\b(?:may|can|could|is it (?:okay|ok)|would it be (?:okay|ok))\b[^?]{0,80}\bEric\b[^?]{0,80}\btext\b/i.test(String(text || ""));
+}
+
+function isSmsConsentWithdrawal(text) {
+  return /\b(?:do not|don't|dont|never|no)\b[^.!?]{0,40}\b(?:text|message)\b|\b(?:stop|cancel|unsubscribe|opt out)\b/i.test(String(text || ""));
+}
+
+function inferSmsConsent(messages) {
+  let decision = null;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.role !== "user") continue;
+    const text = String(message.content || "").trim();
+    const previous = messages[index - 1];
+    if (isSmsConsentWithdrawal(text)) {
+      decision = { accepted: false, text, at: message.at || null };
+      continue;
+    }
+    const explicitTextRequest = /\b(?:yes|yeah|yep|sure|ok|okay|please)\b[^.!?]{0,30}\btext\b|\btext me\b/i.test(text);
+    const promptedAffirmative = previous?.role === "assistant" &&
+      assistantAskedSmsConsent(previous.content) &&
+      /^(?:yes|yeah|yep|sure|ok|okay|please do|that(?:'s| is) fine|sounds good)\b/i.test(text) &&
+      !/\b(?:no|not|never|don'?t|stop|cancel|unsubscribe|opt out)\b/i.test(text);
+    if (explicitTextRequest || promptedAffirmative) {
+      decision = { accepted: true, text, at: message.at || null };
+    } else if (previous?.role === "assistant" && assistantAskedSmsConsent(previous.content) && /^no\b/i.test(text)) {
+      decision = { accepted: false, text, at: message.at || null };
+    }
+  }
+  return decision;
+}
+
 function captureLeadFields(session) {
   session.leadData = session.leadData || { name: null, phone: null, time: null };
   const inferredAcceptance = inferCallbackAcceptance(session.messages);
@@ -829,6 +863,12 @@ function captureLeadFields(session) {
   if (name) session.leadData.name = name;
   if (phone) session.leadData.phone = phone;
   if (time) session.leadData.time = time;
+  const smsConsent = inferSmsConsent(session.messages);
+  if (smsConsent) {
+    session.smsConsentAccepted = smsConsent.accepted;
+    session.smsConsentText = smsConsent.text;
+    session.smsConsentAt = smsConsent.at || session.smsConsentAt || new Date().toISOString();
+  }
 }
 
 function getStage(session) {
@@ -836,6 +876,9 @@ function getStage(session) {
 
   if (session.callbackAccepted) {
     if (session.leadData.name && session.leadData.phone && session.leadData.time) {
+      if (session.smsConsentAccepted !== true && session.smsConsentAccepted !== false) {
+        return STAGES.COLLECT_SMS_CONSENT;
+      }
       return session.callbackConfirmed ? STAGES.DISCOVER : STAGES.CONFIRM;
     }
     if (!session.leadData.name) return STAGES.COLLECT_NAME;
@@ -856,10 +899,9 @@ function getActiveStage(session) {
   if (isCallbackWithdrawal(latestText)) {
     session.callbackAccepted = false;
     session.callbackConfirmed = false;
-    if (session.leadTextTimer) {
-      clearTimeout(session.leadTextTimer);
-      session.leadTextTimer = null;
-    }
+    session.smsConsentAccepted = false;
+    session.smsConsentText = latestText;
+    session.smsConsentAt = new Date().toISOString();
     return STAGES.DISCOVER;
   }
 
@@ -895,6 +937,7 @@ function getSession(sessionId) {
     ? extractPhoneFromSession({ messages: storedMessages })
     : null;
   const storedTime = storedCallbackAccepted ? extractTime(storedMessages) : null;
+  const storedSmsConsent = inferSmsConsent(storedMessages);
   const newSession = {
     messages: initialMessages,
     lastAccess: Date.now(),
@@ -904,6 +947,9 @@ function getSession(sessionId) {
     leadData: { name: storedName, phone: storedPhone, time: storedTime },
     callbackAccepted: storedCallbackAccepted,
     callbackConfirmed: Boolean(storedName && storedPhone && storedTime),
+    smsConsentAccepted: storedSmsConsent?.accepted ?? null,
+    smsConsentText: storedSmsConsent?.text ?? null,
+    smsConsentAt: storedSmsConsent?.at ?? null,
     stage: STAGES.OPEN,
     newChatNotified: false,
     startedAt: Date.now(),
@@ -1282,50 +1328,60 @@ function extractContext(messages) {
   return context;
 }
 
-// --- iMessage via osascript ---
+// --- Guarded message intent webhook ---
 
-function sendIMessage(phone, text) {
-  if (!ENABLE_IMESSAGE) {
-    console.log("Skipping iMessage (ENABLE_IMESSAGE is false)");
-    return;
+function buildMessageIntent(lead) {
+  if (lead.status !== "completed" || lead.smsConsentAccepted !== true) return null;
+  return {
+    version: 1,
+    event_id: lead.messageIntentEventId,
+    type: "jennifer_callback_text",
+    template_id: "jennifer_initial_callback_v1",
+    session_id: lead.sessionId,
+    recipient: lead.phone,
+    first_name: String(lead.name || "there").trim().split(/\s+/)[0],
+    sms_consent_at: lead.smsConsentAt,
+    sms_consent_version: "jennifer_sms_v1",
+    sms_consent_text: String(lead.smsConsentText || "").slice(0, 160),
+    created_at: lead.createdAt,
+  };
+}
+
+function signMessageIntent(secret, timestamp, rawBody) {
+  return "sha256=" + createHmac("sha256", secret).update(timestamp + "." + rawBody).digest("hex");
+}
+
+function messageIntentEventId(sessionId) {
+  const hex = createHash("sha256")
+    .update("jennifer:" + sessionId + ":initial-callback-text:v1")
+    .digest("hex")
+    .slice(0, 32)
+    .split("");
+  hex[12] = "5";
+  hex[16] = "8";
+  const value = hex.join("");
+  return [value.slice(0, 8), value.slice(8, 12), value.slice(12, 16), value.slice(16, 20), value.slice(20)].join("-");
+}
+
+function sendMessageIntent(lead) {
+  const intent = buildMessageIntent(lead);
+  if (!intent || !MESSAGE_INTENT_URL || !MESSAGE_INTENT_SECRET) {
+    return Promise.resolve({ status: "disabled" });
   }
-
-  if (os.platform() !== "darwin") {
-    console.log("Skipping iMessage on non-macOS platform", os.platform());
-    return;
-  }
-
-  const safeText = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const script = [
-    'tell application "Messages"',
-    "  set targetService to 1st account whose service type = iMessage",
-    '  set targetBuddy to buddy "' + phone + '" of targetService',
-    '  send "' + safeText + '" to targetBuddy',
-    "end tell",
-  ].join("\n");
-
-  const tmpFile = path.join(
-    os.tmpdir(),
-    "imsg-" +
-      Date.now() +
-      "-" +
-      Math.random().toString(36).slice(2) +
-      ".scpt"
-  );
-  fs.writeFileSync(tmpFile, script);
-
-  execFile("osascript", [tmpFile], { timeout: 30000 }, (err) => {
-    if (err) {
-      console.error(
-        "iMessage send error to " + phone + ":",
-        err.message.substring(0, 200)
-      );
-    } else {
-      console.log("iMessage sent to " + phone);
-    }
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch (_) {}
+  const rawBody = JSON.stringify(intent);
+  const timestamp = new Date().toISOString();
+  return fetch(MESSAGE_INTENT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Jennifer-Timestamp": timestamp,
+      "X-Jennifer-Signature": signMessageIntent(MESSAGE_INTENT_SECRET, timestamp, rawBody),
+    },
+    body: rawBody,
+    signal: AbortSignal.timeout(15000),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error("intent webhook returned " + response.status);
+    return response.json();
   });
 }
 
@@ -1491,16 +1547,18 @@ function summarizeConversation(messages, callback) {
 function checkAndSendLead(session, sessionId) {
   if (session.callbackAccepted === false) return;
   const existingLead = leadsBySession.get(sessionId);
-  if (existingLead && existingLead.status === "completed") {
-    session.leadSent = true;
-    return;
-  }
   if (session.leadSent && !existingLead) return;
   if (!session.leadData.phone) return;
 
   const context = extractContext(session.messages);
   const leadStatus = session.leadData.name && session.leadData.time ? "completed" : "partial";
-  if (existingLead && existingLead.status === leadStatus) return;
+  const smsConsentAccepted = session.smsConsentAccepted === true
+    ? true
+    : session.smsConsentAccepted === false
+      ? false
+      : null;
+  if (existingLead && existingLead.status === leadStatus &&
+      existingLead.smsConsentAccepted === smsConsentAccepted) return;
   const leadScore = scoreLead(session.messages, context, session.leadData);
   const reasonRaw = extractReasonRaw(session.messages);
   session.leadSent = true;
@@ -1528,6 +1586,12 @@ function checkAndSendLead(session, sessionId) {
     urgency: context.urgency || null,
     createdAt: new Date().toISOString(),
     source: "jennifer-chat",
+    smsConsentAccepted,
+    smsConsentAt: session.smsConsentAt || null,
+    smsConsentText: session.smsConsentText || null,
+    messageIntentEventId: existingLead?.messageIntentEventId ||
+      (leadStatus === "completed" && smsConsentAccepted === true ? messageIntentEventId(sessionId) : null),
+    messageIntentStatus: existingLead?.messageIntentStatus || null,
   };
   storeLeadRecord(leadRecord);
 
@@ -1589,15 +1653,27 @@ function checkAndSendLead(session, sessionId) {
     sendTelegramAlert(lines.join("\n"));
   });
 
-  // Text the lead as Eric after a delay — feels human, not instant bot
-  if (leadStatus === "completed") {
-    session.leadTextTimer = setTimeout(() => {
-      session.leadTextTimer = null;
-      sendIMessage(
-        leadPhone,
-        "hey " + leadName + ", this is Eric with Affordable Solar. jennifer mentioned you had some questions about going solar. do you have a few minutes to chat?"
+  if (leadStatus === "completed" && smsConsentAccepted === true && !existingLead?.messageIntentEventId) {
+    leadRecord.messageIntentStatus = MESSAGE_INTENT_URL && MESSAGE_INTENT_SECRET ? "submitting" : "disabled";
+    storeLeadRecord(leadRecord);
+    sendMessageIntent(leadRecord).then((result) => {
+      const current = leadsBySession.get(sessionId) || leadRecord;
+      storeLeadRecord({
+        ...current,
+        messageIntentStatus: result?.status === "accepted" || result?.status === "duplicate"
+          ? result.status
+          : "disabled",
+      });
+    }).catch((error) => {
+      const current = leadsBySession.get(sessionId) || leadRecord;
+      storeLeadRecord({ ...current, messageIntentStatus: "failed" });
+      console.error("Jennifer message intent failed for session " + sessionId + ":", error.message);
+      sendPushoverAlert(
+        "Jennifer text intent failed",
+        "No customer text was queued. Session: " + sessionId,
+        { priority: 1, sound: "pushover", url: historyUiUrl(), urlTitle: "Open chat history" }
       );
-    }, LEAD_TEXT_DELAY);
+    });
   }
 }
 
@@ -1901,6 +1977,8 @@ const server = http.createServer((req, res) => {
         if (session?.leadData.name) knownParts.push("name: " + session.leadData.name);
         if (session?.leadData.phone) knownParts.push("phone number captured");
         if (session?.leadData.time) knownParts.push("preferred time: " + session.leadData.time);
+        if (session?.smsConsentAccepted === true) knownParts.push("text permission granted");
+        if (session?.smsConsentAccepted === false) knownParts.push("text permission declined");
         const contextNote = knownParts.length > 0
           ? "\n\nCONFIRMED CALLBACK DETAILS: " + knownParts.join(", ") + ". Do not ask for captured fields again."
           : "";
@@ -2036,8 +2114,8 @@ function startServer() {
   return server.listen(PORT, () => {
     console.log("Solar chat proxy listening on port " + PORT);
     console.log("Session TTL: " + SESSION_TTL / 1000 + "s");
-    console.log("Lead notifications: iMessage to " + ERIC_PHONE);
-    console.log("Stages: OPEN → DISCOVER → COLLECT_NAME → COLLECT_PHONE → CONFIRM");
+    console.log("Lead message intents:", MESSAGE_INTENT_URL && MESSAGE_INTENT_SECRET ? "configured" : "disabled");
+    console.log("Stages: OPEN → DISCOVER → COLLECT_NAME → COLLECT_PHONE → COLLECT_TIME → COLLECT_SMS_CONSENT → CONFIRM");
   });
 }
 
@@ -2053,6 +2131,10 @@ module.exports = {
   extractReasonRaw,
   extractName,
   extractTime,
+  inferSmsConsent,
+  buildMessageIntent,
+  messageIntentEventId,
+  signMessageIntent,
   getActiveStage,
   getStage,
   getDirectCallResponse,

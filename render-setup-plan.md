@@ -32,9 +32,9 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - `PUSHOVER_DEVICE` (optional, targets one Pushover device)
 - `CHAT_HISTORY_ACCESS_TOKEN` (required when history endpoints are protected)
 - `JENNIFER_SYSTEM_PROMPT_PATH` (optional, defaults to `./jennifer-system-prompt.txt`)
-- `LEAD_TEXT_DELAY_MS` (optional, defaults to `240000`)
 - `LEAD_SUMMARY_ENABLED` (optional `true`/`false`; Render currently keeps this disabled)
-- `ENABLE_IMESSAGE` (optional `false` by default)
+- `JENNIFER_MESSAGE_INTENT_URL` (optional; fixed signed-intent endpoint)
+- `JENNIFER_MESSAGE_INTENT_SECRET` (required only to enable signed message intents)
 
 ## Runtime endpoints
 - `GET /` returns proxy health: `{"status":"Solar chat proxy running"}`
@@ -61,6 +61,8 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - Capturing callback details does not end the conversation.
 - A lead can be `partial` once a phone number is captured.
 - A lead becomes `completed` when name, phone, and preferred call time are captured.
+- A completed lead asks separately whether Eric may text the captured number.
+  Callback consent alone is never text consent.
 - Lead records are stored in `chat-leads.jsonl` and exposed through `/leads`.
 - Chat history is stored in `chat-history.jsonl` and exposed through `/history-ui`.
 
@@ -81,7 +83,9 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 ## Notes before deploy
 - `jennifer-proxy.js` uses container-safe, repo-relative prompt resolution for `/chat` startup.
 - Claims under `APPROVED KNOWLEDGE` in `jennifer-system-prompt.txt` are business-owned claims and must be reverified when products, certifications, warranties, financing, service coverage, or utility facts change.
-- iMessage send path is guarded behind `ENABLE_IMESSAGE=true` and falls back on Linux hosts.
+- Jennifer never invokes Messages or accepts an outbound body. With explicit
+  text consent and both intent settings present, it sends a signed fixed-template
+  intent to the Mac queue; customer dispatch remains independently disabled.
 - Ollama summary is guarded behind `OLLAMA_HOST` + timeout; default keep disabled unless explicitly enabled.
 - Pushover and Telegram are optional. Missing notification credentials must not break chat handling.
 - Pushover secrets can be copied from local config files into Render env vars without committing values:

@@ -12,10 +12,10 @@ services:
         value: ./jennifer-system-prompt.txt
       - key: LEAD_SUMMARY_ENABLED
         value: "0"
-      - key: ENABLE_IMESSAGE
-        value: "0"
-      - key: LEAD_TEXT_DELAY_MS
-        value: "240000"
+      - key: JENNIFER_MESSAGE_INTENT_URL
+        value: https://ops.affordablesolar.io/webhooks/jennifer/message-intent
+      - key: JENNIFER_MESSAGE_INTENT_SECRET
+        sync: false
       - key: OLLAMA_HOST
         value: http://localhost:11434
       - key: OLLAMA_MODEL

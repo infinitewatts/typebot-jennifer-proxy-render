@@ -13,6 +13,10 @@ const {
   extractReasonRaw,
   extractName,
   extractTime,
+  inferSmsConsent,
+  buildMessageIntent,
+  messageIntentEventId,
+  signMessageIntent,
   getActiveStage,
   postProcess,
   isDirectCallRequest,
@@ -186,6 +190,81 @@ test("an accepted callback remains available after handoff consent", () => {
     postProcess(response, STAGES.COLLECT_NAME, currentSession),
     response
   );
+});
+
+test("callback consent alone never becomes text consent", () => {
+  assert.equal(
+    inferSmsConsent([
+      assistant("Would you like Eric to call you?"),
+      user("yes, that works"),
+    ]),
+    null
+  );
+});
+
+test("text consent requires an explicit affirmative answer to the text question", () => {
+  const prompt = assistant("May Eric text this number about your solar questions? You can say no.");
+  assert.deepEqual(
+    inferSmsConsent([prompt, user("yes, that's fine")]),
+    { accepted: true, text: "yes, that's fine", at: null }
+  );
+  assert.deepEqual(
+    inferSmsConsent([prompt, user("no, do not text me")]),
+    { accepted: false, text: "no, do not text me", at: null }
+  );
+});
+
+test("completed callback details pause for text permission before confirmation", () => {
+  const currentSession = session([], STAGES.COLLECT_TIME, {
+    name: "Rachel Green",
+    phone: "4055551234",
+    time: "afternoons",
+  });
+  currentSession.callbackAccepted = true;
+  currentSession.smsConsentAccepted = null;
+  assert.equal(getActiveStage(currentSession), STAGES.COLLECT_SMS_CONSENT);
+
+  currentSession.messages.push(
+    assistant("May Eric text this number about your solar questions? You can say no."),
+    user("yes")
+  );
+  assert.equal(getActiveStage(currentSession), STAGES.CONFIRM);
+  assert.equal(currentSession.smsConsentAccepted, true);
+  assert.equal(currentSession.smsConsentText, "yes");
+});
+
+test("message intents contain consent proof and a template id, never a remote body", () => {
+  const lead = {
+    status: "completed",
+    sessionId: "session-123",
+    phone: "+14055551234",
+    name: "Rachel Green",
+    smsConsentAccepted: true,
+    smsConsentAt: "2026-08-02T18:00:00.000Z",
+    smsConsentText: "yes, that's fine",
+    messageIntentEventId: "11111111-1111-4111-8111-111111111111",
+    createdAt: "2026-08-02T18:00:01.000Z",
+  };
+  const intent = buildMessageIntent(lead);
+  assert.equal(intent.template_id, "jennifer_initial_callback_v1");
+  assert.equal(intent.sms_consent_version, "jennifer_sms_v1");
+  assert.equal("body" in intent, false);
+  assert.equal(buildMessageIntent({ ...lead, smsConsentAccepted: false }), null);
+
+  const raw = JSON.stringify(intent);
+  assert.equal(
+    signMessageIntent("secret", "2026-08-02T18:00:02.000Z", raw),
+    signMessageIntent("secret", "2026-08-02T18:00:02.000Z", raw)
+  );
+  assert.notEqual(
+    signMessageIntent("secret", "2026-08-02T18:00:02.000Z", raw),
+    signMessageIntent("other", "2026-08-02T18:00:02.000Z", raw)
+  );
+
+  const eventId = messageIntentEventId("session-123");
+  assert.match(eventId, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(eventId, messageIntentEventId("session-123"));
+  assert.notEqual(eventId, messageIntentEventId("session-456"));
 });
 
 test("asking to call the office does not consent to a callback", () => {
