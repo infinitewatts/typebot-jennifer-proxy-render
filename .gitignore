@@ -13,3 +13,4 @@ proxy.log
 *.bak-*
 *.backup*
 *.pre-summary
+chat-history.jsonl

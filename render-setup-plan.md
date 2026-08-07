@@ -85,7 +85,9 @@ Move only Jennifer chat proxy first (`:3090`) to Render.
 - Claims under `APPROVED KNOWLEDGE` in `jennifer-system-prompt.txt` are business-owned claims and must be reverified when products, certifications, warranties, financing, service coverage, or utility facts change.
 - Jennifer never invokes Messages or accepts an outbound body. With explicit
   text consent and both intent settings present, it sends a signed fixed-template
-  intent to the Mac queue; customer dispatch remains independently disabled.
+  intent to the Mac queue. The Mac may dispatch it automatically only to an
+  existing direct chat, during configured daytime hours, with STOP suppression
+  and a 24-hour per-recipient cooldown; new conversations remain disabled.
 - Ollama summary is guarded behind `OLLAMA_HOST` + timeout; default keep disabled unless explicitly enabled.
 - Pushover and Telegram are optional. Missing notification credentials must not break chat handling.
 - Pushover secrets can be copied from local config files into Render env vars without committing values:
